@@ -1,0 +1,32 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ---- Virtual env ----
+.venv/
+env/
+venv/
+
+# ---- Artifacts / Logs ----
+artifacts/
+gateway/artifacts/
+*.jsonl
+
+# ---- Secrets ----
+configs/server.yaml
+*.env
+
+# ---- HuggingFace cache ----
+hf-cache/
+.cache/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# Local request/test scripts
+req.json
+stream_test.py
+tools/

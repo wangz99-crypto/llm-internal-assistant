@@ -1,0 +1,19 @@
+auth:
+  enabled: true
+  api_keys:
+    - key: "REPLACE_ME"
+      user_id: "admin_user"
+      role: "admin"
+
+policy:
+  max_input_chars: 8000
+  max_tokens_default: 256
+  max_tokens_admin: 512
+  rate_limit_rpm_user: 30
+  rate_limit_rpm_admin: 120
+  timeout_seconds: 60
+
+backend:
+  engine: "vllm"
+  model: "Qwen/Qwen2.5-1.5B-Instruct"
+  embedding_model: "BAAI/bge-small-en-v1.5"

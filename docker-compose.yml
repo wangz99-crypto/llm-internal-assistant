@@ -1,0 +1,48 @@
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
+    ports:
+      - "8001:8000"
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    command:
+      - "--model"
+      - "Qwen/Qwen2.5-1.5B-Instruct"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--gpu-memory-utilization"
+      - "0.80"
+      - "--max-model-len"
+      - "1536"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  gateway:
+    build:
+      context: ./gateway
+    container_name: gateway
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./gateway:/app                 
+      - ./configs:/app/configs:ro
+      - ./artifacts:/app/artifacts              
+    environment:
+      - CONFIG_PATH=/app/configs/server.yaml
+      - VLLM_BASE_URL=http://vllm:8000
+    depends_on:
+      - vllm
+
+
+volumes:
+  hf-cache:
