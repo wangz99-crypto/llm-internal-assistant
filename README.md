@@ -204,7 +204,7 @@ curl -X POST http://127.0.0.1:8000/ask \
 ```
 The response includes grounded citations retrieved from internal KB documents.
 
-## Why This Project Matters (Interview Summary)
+## Project Summary
 
 This project demonstrates applied LLM engineering beyond prompt demos:
 
@@ -215,7 +215,7 @@ This project demonstrates applied LLM engineering beyond prompt demos:
 - implementing CI-safe testing patterns  
 
 It reflects how internal AI assistants are built in real organizations.
----
+
 
 ## Contact
 
