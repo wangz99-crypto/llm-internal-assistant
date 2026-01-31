@@ -61,7 +61,7 @@ The `/ask` endpoint returns a production-style JSON envelope:
 
 Example:
 
-```json
+```
 {
   "request_id": "...",
   "status": "ok",
@@ -73,6 +73,7 @@ Example:
   "sources": [...],
   "timings_ms": {...}
 }
+```
 ### Operational KB Management
 
 Admins can hot-reload the Knowledge Base (KB) without restarting the service:
