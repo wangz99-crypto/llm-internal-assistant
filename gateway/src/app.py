@@ -18,7 +18,9 @@ from contextlib import asynccontextmanager
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-from sentence_transformers import SentenceTransformer
+
+
+
 
 
 # ----------------------------
@@ -199,23 +201,51 @@ def cosine_topk_with_scores(query_vec: np.ndarray, mat: np.ndarray, k: int = 3) 
     return [(int(i), float(sims[i])) for i in idxs]
 
 
-# ----------------------------
-# Configuration loading
-# ----------------------------
 def load_settings() -> Settings:
+    """
+    Load Settings from YAML config.
+    - Uses CONFIG_PATH env if set, else defaults to configs/server.yaml
+    - CI-friendly fallback to gateway/configs/server.example.yaml when missing
+    - Allows ENV override for VLLM_BASE_URL
+    """
+    # 1) Resolve config path
     config_path = os.environ.get("CONFIG_PATH", "configs/server.yaml")
-    vllm_base_url = os.environ.get("VLLM_BASE_URL", "http://localhost:8001")
+    path = Path(config_path)
 
-    cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+    if not path.exists():
+        # Fallback: <repo>/gateway/configs/server.example.yaml
+        # This file lives at: gateway/src/app.py -> parents[1] == gateway/
+        fallback = Path(__file__).resolve().parents[1] / "configs" / "server.example.yaml"
+        if fallback.exists():
+            path = fallback
+        else:
+            raise FileNotFoundError(
+                f"Config not found: {path} (CONFIG_PATH={config_path}). "
+                f"Fallback also missing: {fallback}"
+            )
 
-    auth_enabled = bool(cfg.get("auth", {}).get("enabled", True))
-    api_keys_cfg = cfg.get("auth", {}).get("api_keys", [])
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+    # 2) Backend base URL (ENV override)
+    vllm_base_url = os.environ.get("VLLM_BASE_URL", str(cfg.get("backend", {}).get("vllm_base_url", "http://localhost:8001")))
+    vllm_base_url = vllm_base_url.rstrip("/")
+
+    # 3) Auth
+    auth_cfg = cfg.get("auth", {}) or {}
+    auth_enabled = bool(auth_cfg.get("enabled", True))
+    api_keys_cfg = auth_cfg.get("api_keys", []) or []
 
     api_keys: Dict[str, ApiKeyUser] = {}
     for item in api_keys_cfg:
-        api_keys[item["key"]] = ApiKeyUser(user_id=item["user_id"], role=item["role"])
+        # defensive reads
+        key = str(item.get("key", "")).strip()
+        user_id = str(item.get("user_id", "")).strip()
+        role = str(item.get("role", "user")).strip()
+        if key:
+            api_keys[key] = ApiKeyUser(user_id=user_id, role=role)
 
-    pol = cfg.get("policy", {})
+    # 4) Policy
+    pol = cfg.get("policy", {}) or {}
     policy = Policy(
         max_input_chars=int(pol.get("max_input_chars", 8000)),
         max_tokens_default=int(pol.get("max_tokens_default", 256)),
@@ -225,18 +255,22 @@ def load_settings() -> Settings:
         timeout_seconds=int(pol.get("timeout_seconds", 60)),
     )
 
-    backend = cfg.get("backend", {})
-    model = str(backend.get("model", "Qwen/Qwen2.5-1.5B-Instruct"))
-    embedding_model = str(backend.get("embedding_model", model))
+    # 5) Model / Embeddings model
+    backend = cfg.get("backend", {}) or {}
+    model = str(backend.get("model", "Qwen/Qwen2.5-1.5B-Instruct")).strip()
+
+    # Important: embeddings model should default to a real embedding model, not the chat model
+    embedding_model = str(backend.get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")).strip()
 
     return Settings(
         auth_enabled=auth_enabled,
         api_keys=api_keys,
         policy=policy,
-        vllm_base_url=vllm_base_url.rstrip("/"),
+        vllm_base_url=vllm_base_url,
         model=model,
         embedding_model=embedding_model,
     )
+
 
 
 def auth_user(x_api_key: Optional[str]) -> ApiKeyUser:
@@ -295,20 +329,50 @@ LAT_MS = Histogram(
     buckets=(50, 100, 200, 400, 800, 1500, 3000, 6000, 12000),
     )
 # CPU embedder for RAG (no vLLM embeddings)
-EMBEDDER = SentenceTransformer(SETTINGS.embedding_model)
+# NOTE: lazy init so importing src.app won't trigger HF downloads in CI
+_EMBEDDER = None
+
+# ----------------------------
+# Embeddings (CPU) for RAG
+# ----------------------------
+_EMBEDDER = None
+
+def get_embedder():
+    """
+    Lazy import + lazy init.
+    IMPORTANT: do not import sentence_transformers at module import time,
+    otherwise CI will require torch.
+    """
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        from sentence_transformers import SentenceTransformer  # local import
+        _EMBEDDER = SentenceTransformer(SETTINGS.embedding_model)
+    return _EMBEDDER
 
 
 async def embed_texts(texts: list[str]) -> np.ndarray:
+    """
+    CPU embeddings for RAG using SentenceTransformers.
+
+    CI-friendly: if DISABLE_EMBEDDINGS=1, return zeros (deterministic) and
+    avoids importing sentence_transformers/torch.
+    """
+    if os.getenv("DISABLE_EMBEDDINGS", "0") == "1":
+        return np.zeros((len(texts), 384), dtype=np.float32)
+
+    embedder = get_embedder()
+
     def _encode():
-        vecs = EMBEDDER.encode(
+        return embedder.encode(
             texts,
             normalize_embeddings=True,
             batch_size=32,
             show_progress_bar=False,
         )
-        return np.array(vecs, dtype=np.float32)
 
-    return await asyncio.to_thread(_encode)
+    vecs = await asyncio.to_thread(_encode)
+    return np.array(vecs, dtype=np.float32)
+
 
 
 
