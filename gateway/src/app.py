@@ -563,155 +563,167 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
     t0 = _now_ms()
 
     user = auth_user(x_api_key)
-    _check_rate_limit(user, SETTINGS.policy)
 
-    payload = await request.json()
-    question = str(payload.get("question", "")).strip()
-    k = int(payload.get("k", 3))
+    status = "ok"
+    model_name = SETTINGS.model  
+    try:
+        _check_rate_limit(user, SETTINGS.policy)
 
-    if not question:
-        raise HTTPException(status_code=400, detail="Missing question.")
+        payload = await request.json()
+        question = str(payload.get("question", "")).strip()
+        k = int(payload.get("k", 3))
 
-    warnings: list[str] = []
-    sources: list[dict] = []
-    context = ""
+        if not question:
+            status = "blocked"
+            raise HTTPException(status_code=400, detail="Missing question.")
 
-    # ----------------------------
-    # 1) RAG retrieval
-    # ----------------------------
-    t_embed0 = _now_ms()
-    async with KB_LOCK:
-        has_kb = (KB_EMB is not None and bool(KB_CHUNKS))
+        warnings: list[str] = []
+        sources: list[dict] = []
+        context = ""
 
-    if has_kb:
-        # embed question (outside lock)
-        q_emb = await embed_texts([question])
-    t_embed1 = _now_ms()
-
-    t_ret0 = _now_ms()
-    if has_kb:
+        # ----------------------------
+        # 1) RAG retrieval
+        # ----------------------------
+        t_embed0 = _now_ms()
         async with KB_LOCK:
-            hits = cosine_topk_with_scores(q_emb[0], KB_EMB, k=k)
+            has_kb = (KB_EMB is not None and bool(KB_CHUNKS))
 
-            ctx_parts = []
-            for rank, (i, score) in enumerate(hits, start=1):
-                chunk = KB_CHUNKS[i]
-                card = citation_card(chunk, score, i)  # your function
-                card["rank"] = rank
-                sources.append(card)
+        if has_kb:
+            q_emb = await embed_texts([question])
+        t_embed1 = _now_ms()
 
-                section = card.get("section") or ""
-                ctx_parts.append(
-                    f"[{rank}] {card.get('source')} {section} (score={score:.4f}, chunk={i})\n"
-                    f"{chunk.get('text','')}"
-                )
+        t_ret0 = _now_ms()
+        if has_kb:
+            async with KB_LOCK:
+                hits = cosine_topk_with_scores(q_emb[0], KB_EMB, k=k)
+                ctx_parts = []
+                for rank, (i, score) in enumerate(hits, start=1):
+                    chunk = KB_CHUNKS[i]
+                    card = citation_card(chunk, score, i)
+                    card["rank"] = rank
+                    sources.append(card)
 
-            context = "\n\n".join(ctx_parts)
-    else:
-        warnings.append("KB index is empty or not loaded. Answer may be ungrounded.")
+                    section = card.get("section") or ""
+                    ctx_parts.append(
+                        f"[{rank}] {card.get('source')} {section} (score={score:.4f}, chunk={i})\n"
+                        f"{chunk.get('text','')}"
+                    )
+                context = "\n\n".join(ctx_parts)
+        else:
+            warnings.append("KB index is empty or not loaded. Answer may be ungrounded.")
 
-    t_ret1 = _now_ms()
+        t_ret1 = _now_ms()
 
-    # ----------------------------
-    # 2) LLM call (force UI JSON)
-    # ----------------------------
-    system_prompt = (
-        "You are a helpful internal assistant.\n"
-        "Use the provided Internal Context when relevant.\n"
-        "Return STRICT JSON only (no markdown, no code fences) with EXACT keys:\n"
-        "- summary: string\n"
-        "- steps: array of strings\n"
-        "- notes: array of strings\n"
-        "- confidence: number between 0 and 1\n"
-        "If the answer is not in the context, say you are not sure in summary and keep steps empty.\n"
-        "Do not include any extra keys."
-    )
+        # ----------------------------
+        # 2) LLM call (force UI JSON)
+        # ----------------------------
+        system_prompt = (
+            "You are a helpful internal assistant.\n"
+            "Use the provided Internal Context when relevant.\n"
+            "Return STRICT JSON only (no markdown, no code fences) with EXACT keys:\n"
+            "- summary: string\n"
+            "- steps: array of strings\n"
+            "- notes: array of strings\n"
+            "- confidence: number between 0 and 1\n"
+            "If the answer is not in the context, say you are not sure in summary and keep steps empty.\n"
+            "Do not include any extra keys."
+        )
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": f"Question:\n{question}\n\nInternal Context:\n{context}"
-        },
-    ]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Question:\n{question}\n\nInternal Context:\n{context}"},
+        ]
 
-    url = f"{SETTINGS.vllm_base_url}/v1/chat/completions"
-    vllm_payload = {
-        "model": SETTINGS.model,
-        "messages": messages,
-        "max_tokens": SETTINGS.policy.max_tokens_default,
-        "temperature": 0.2,
-    }
-
-    t_llm0 = _now_ms()
-    timeout = httpx.Timeout(SETTINGS.policy.timeout_seconds)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(url, json=vllm_payload)
-        r.raise_for_status()
-        out = r.json()
-    t_llm1 = _now_ms()
-
-    raw_answer = out["choices"][0]["message"]["content"]
-    answer_obj = safe_parse_ui_json(raw_answer)
-
-    # ----------------------------
-    # 3) Audit (no raw prompt)
-    # ----------------------------
-    t_aud0 = _now_ms()
-    q_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
-    write_audit({
-        "request_id": request_id,
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "user_id": user.user_id,
-        "role": user.role,
-        "engine": "vllm",
-        "model": SETTINGS.model,
-        "prompt_hash": q_hash,
-        "status": "ok",
-        "latency_ms": (t_llm1 - t0),
-        "rag": True,
-        "rag_k": k,
-        "rag_sources": list({s.get("source") for s in sources if s.get("source")}),
-    })
-    t_aud1 = _now_ms()
-
-    # ----------------------------
-    # 4) Meta / UI payload
-    # ----------------------------
-    async with KB_LOCK:
-        kb_files = len({c["source"] for c in KB_CHUNKS})
-        kb_chunks = len(KB_CHUNKS)
-
-    t1 = _now_ms()
-
-    return {
-        "request_id": request_id,
-        "status": "ok",
-        "answer": answer_obj,
-        "sources": sources,     # <- rename from citations to sources (UI friendly)
-        "meta": {
-            "k": k,
-            "kb": {
-                "dir": str(display_source(str(KB_DIR))),
-                "files": kb_files,
-                "chunks": kb_chunks,
-            },
+        url = f"{SETTINGS.vllm_base_url}/v1/chat/completions"
+        vllm_payload = {
             "model": SETTINGS.model,
+            "messages": messages,
+            "max_tokens": SETTINGS.policy.max_tokens_default,
+            "temperature": 0.2,
+        }
+
+        t_llm0 = _now_ms()
+        timeout = httpx.Timeout(SETTINGS.policy.timeout_seconds)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(url, json=vllm_payload)
+            r.raise_for_status()
+            out = r.json()
+        t_llm1 = _now_ms()
+
+        raw_answer = out["choices"][0]["message"]["content"]
+        answer_obj = safe_parse_ui_json(raw_answer)
+
+        # ----------------------------
+        # 3) Audit (no raw prompt)
+        # ----------------------------
+        t_aud0 = _now_ms()
+        q_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+        write_audit({
+            "request_id": request_id,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "user_id": user.user_id,
+            "role": user.role,
             "engine": "vllm",
-        },
-        "timings_ms": {
-            "embed": (t_embed1 - t_embed0) if has_kb else 0,
-            "retrieve": (t_ret1 - t_ret0) if has_kb else 0,
-            "llm": (t_llm1 - t_llm0),
-            "audit": (t_aud1 - t_aud0),
-            "total": (t1 - t0),
-        },
-        "warnings": warnings,
-        "debug": {
+            "model": SETTINGS.model,
             "prompt_hash": q_hash,
-            "rag_enabled": bool(has_kb),
-        },
-    }
+            "status": "ok",
+            "latency_ms": (t_llm1 - t0),
+            "rag": True,
+            "rag_k": k,
+            "rag_sources": list({s.get("source") for s in sources if s.get("source")}),
+        })
+        t_aud1 = _now_ms()
+
+        async with KB_LOCK:
+            kb_files = len({c["source"] for c in KB_CHUNKS})
+            kb_chunks = len(KB_CHUNKS)
+
+        t1 = _now_ms()
+
+        return {
+            "request_id": request_id,
+            "status": "ok",
+            "answer": answer_obj,
+            "sources": sources,
+            "meta": {
+                "k": k,
+                "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
+                "model": SETTINGS.model,
+                "engine": "vllm",
+            },
+            "timings_ms": {
+                "embed": (t_embed1 - t_embed0) if has_kb else 0,
+                "retrieve": (t_ret1 - t_ret0) if has_kb else 0,
+                "llm": (t_llm1 - t_llm0),
+                "audit": (t_aud1 - t_aud0),
+                "total": (t1 - t0),
+            },
+            "warnings": warnings,
+            "debug": {"prompt_hash": q_hash, "rag_enabled": bool(has_kb)},
+        }
+
+    except HTTPException as e:
+        # 400/401/403/429/… blocked or error
+        if e.status_code in (400, 401, 403, 429):
+            status = "blocked" if e.status_code != 429 else "blocked"
+        else:
+            status = "error"
+        raise
+
+    except httpx.ReadTimeout:
+        status = "timeout"
+        raise HTTPException(status_code=504, detail="Inference timeout.")
+
+    except Exception:
+        status = "error"
+        raise
+
+    finally:
+        # Minimum interpretable metric: latency+number of requests
+        latency_ms = _now_ms() - t0
+        LAT_MS.labels(role=user.role, model=model_name).observe(latency_ms)
+        REQ_TOTAL.labels(status=status, role=user.role, model=model_name).inc()
+
 
 
 
