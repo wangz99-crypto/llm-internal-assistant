@@ -29,4 +29,7 @@ Thumbs.db
 # Local request/test scripts
 req.json
 stream_test.py
-tools/
+
+# local debug/demo payloads
+demo_ask*.json
+request.json

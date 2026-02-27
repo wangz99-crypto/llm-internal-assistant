@@ -1,0 +1,20 @@
+[
+  {
+    "id": "INC-10021",
+    "sev": 2,
+    "status": "open",
+    "title": "Gateway latency spike on /ask",
+    "service": "llm-gateway",
+    "owner": "oncall-platform",
+    "created_at": "2026-02-25T13:22:10Z"
+  },
+  {
+    "id": "INC-10008",
+    "sev": 3,
+    "status": "open",
+    "title": "KB reload sometimes slow",
+    "service": "llm-gateway",
+    "owner": "oncall-platform",
+    "created_at": "2026-02-18T08:10:45Z"
+  }
+]
