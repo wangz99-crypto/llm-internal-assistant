@@ -16,15 +16,13 @@ import yaml
 from fastapi import FastAPI, Header, HTTPException, Request
 from contextlib import asynccontextmanager
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 # --- tools (business layer) ---
 from src.tools.router import route_tool
 from src.tools.incident_tool import list_open_incidents
 from src.tools.runbook_tool import get_sev_checklist
-
-
-
 
 # ----------------------------
 # Config
@@ -275,6 +273,7 @@ def load_settings() -> Settings:
     )
 
 
+DEMO_MODE = os.getenv("DEMO_MODE", "0") == "1"
 
 def auth_user(x_api_key: Optional[str]) -> ApiKeyUser:
     if not SETTINGS.auth_enabled:
@@ -479,6 +478,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Internal LLM Gateway with RAG", version="0.2.0", lifespan=lifespan)
 
+# ----------------------------
+# CORS (for website playground)
+# ----------------------------
+allowed = os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
+allowed = [x.strip() for x in allowed if x.strip()]
+
+if allowed:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed,
+        allow_credentials=False,
+        allow_methods=["POST", "GET", "OPTIONS"],
+        allow_headers=["Content-Type", "x-api-key"],
+    )
+
 
 @app.post("/reload_kb")
 async def reload_kb(x_api_key: Optional[str] = Header(default=None)):
@@ -601,6 +615,34 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
             else:
                 tool_result = None
                 warnings.append(f"Tool routed but not implemented: {tool_name}")
+
+        # ----------------------------
+        # DEMO MODE: tool-only, no LLM/RAG dependency
+        # ----------------------------
+        if DEMO_MODE and tool_result is None:
+            # Demo: tool-only, no LLM/RAG dependency
+            return {
+                "request_id": request_id,
+                "status": "blocked",
+                "answer": {
+                    "summary": "Demo mode is tool-first only. Try: 'Show me the SEV-2 checklist' or 'List open Sev-2 incidents'.",
+                    "steps": [],
+                    "notes": ["DEMO_MODE=1 keeps this demo reliable and cost-free (no LLM calls)."],
+                    "confidence": 0.9
+                },
+                "sources": [],
+                "tool": {"used": None, "result": None},
+                "meta": {
+                    "k": k,
+                    "mode": "demo_tool_only",
+                    "kb": {"dir": str(display_source(str(KB_DIR))), "files": 0, "chunks": 0},
+                    "model": None,
+                    "engine": "tool",
+                },
+                "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": 0, "total": (_now_ms() - t0)},
+                "warnings": ["DEMO_MODE=1: LLM/RAG disabled"],
+                "debug": {"prompt_hash": hashlib.sha256(question.encode("utf-8")).hexdigest()[:16], "rag_enabled": False},
+            }
 
         # ----------------------------
         # Deterministic tool response (skip LLM)
