@@ -18,7 +18,10 @@ from contextlib import asynccontextmanager
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-
+# --- tools (business layer) ---
+from src.tools.router import route_tool
+from src.tools.incident_tool import list_open_incidents
+from src.tools.runbook_tool import get_sev_checklist
 
 
 
@@ -379,9 +382,6 @@ async def embed_texts(texts: list[str]) -> np.ndarray:
 async def build_kb_index() -> None:
     global KB_CHUNKS, KB_EMB
 
-async def build_kb_index() -> None:
-    global KB_CHUNKS, KB_EMB
-
     async with KB_LOCK:
         if not KB_DIR.exists():
             KB_CHUNKS = []
@@ -524,7 +524,8 @@ async def kb_status(x_api_key: Optional[str] = Header(default=None)):
     }
 
 def _now_ms() -> int:
-    return int(time.time() * 1000)
+    # monotonic, higher precision than time.time()
+    return int(time.perf_counter() * 1000)
 
 def strip_fenced_json(text: str) -> str:
     """
@@ -582,7 +583,202 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         context = ""
 
         # ----------------------------
-        # 1) RAG retrieval
+        # 0) Tool invocation (business layer)
+        # ----------------------------
+        tool_used = None
+        tool_result = None
+
+        routed = route_tool(question)
+        if routed is not None:
+            tool_name, tool_args = routed
+            tool_used = tool_name
+
+            # Execute tool (deterministic, no LLM)
+            if tool_name == "incident.list_open":
+                tool_result = list_open_incidents(question, limit=int(tool_args.get("limit", 10)))
+            elif tool_name == "runbook.get_checklist":
+                tool_result = get_sev_checklist(sev=int(tool_args.get("sev", 2)))
+            else:
+                tool_result = None
+                warnings.append(f"Tool routed but not implemented: {tool_name}")
+
+        # ----------------------------
+        # Deterministic tool response (skip LLM)
+        # ----------------------------
+        if tool_result is not None and tool_result.ok:
+            # deterministic structured answer based on tool type
+            if tool_used == "incident.list_open":
+                answer = {
+                    "summary": f"There are {len(tool_result.data.get('items', []))} open incidents.",
+                    "steps": [
+                        f"{it['id']} - {it['title']} (owner: {it.get('owner', 'unassigned')})"
+                        for it in tool_result.data.get("items", [])
+                    ],
+                    "notes": [],
+                    "confidence": 0.98
+                }
+            elif tool_used == "runbook.get_checklist":
+                items = tool_result.data.get("checklist", [])
+                answer = {
+                    "summary": f"SEV{tool_result.data.get('sev', 2)} checklist retrieved from runbook.",
+                    "steps": items[:8],
+                    "notes": ["Use this checklist to stabilize service before deeper RCA."],
+                    "confidence": 0.98
+                }
+            else:
+                # Fallback for unknown tools
+                answer = {
+                    "summary": f"Tool {tool_used} executed successfully.",
+                    "steps": [],
+                    "notes": [],
+                    "confidence": 0.95
+                }
+
+            # tool mode citations (lightweight, distributed across files)
+            sources: list[dict] = []
+            if getattr(tool_result, "citations_hint", None):
+                # normalize hints to file basenames, keep stable order
+                hint_files: list[str] = []
+                seen_hint = set()
+                for h in tool_result.citations_hint:
+                    name = Path(h).name
+                    if name and name not in seen_hint:
+                        hint_files.append(name)
+                        seen_hint.add(name)
+
+                # Index KB chunks by source filename for quick lookup
+                chunks_by_file: dict[str, list[tuple[int, dict]]] = {}
+                for idx, ch in enumerate(KB_CHUNKS):
+                    fname = Path(ch["source"]).name
+                    chunks_by_file.setdefault(fname, []).append((idx, ch))
+
+                def _make_card(idx: int, ch: dict) -> dict:
+                    return {
+                        "id": f"{display_source(ch['source'])}#{idx}",
+                        "title": pretty_title(ch.get("doc_type", "Document"), ch["source"]),
+                        "doc_type": ch.get("doc_type", "Document"),
+                        "section": ch.get("section", ""),
+                        "score": 1.0,  # tool-citation is "policy reference", not similarity
+                        "source": Path(ch["source"]).name,
+                        "preview": ch.get("text", "")[:260],
+                        "chunk_id": idx,
+                        "rank": 0,  # fill later
+                    }
+
+                # 1) First pass: take 1 chunk per hinted file (best coverage)
+                used_files = set()
+                used_chunk_ids = set()
+                for fname in hint_files:
+                    if fname not in chunks_by_file:
+                        continue
+                    # pick the first chunk for that file (stable)
+                    idx, ch = chunks_by_file[fname][0]
+                    card = _make_card(idx, ch)
+                    sources.append(card)
+                    used_files.add(fname)
+                    used_chunk_ids.add(idx)
+                    if len(sources) >= 3:
+                        break
+
+                # 2) Second pass: if still < 3, add more chunks from hinted files (next chunks)
+                if len(sources) < 3:
+                    for fname in hint_files:
+                        if fname not in chunks_by_file:
+                            continue
+                        for idx, ch in chunks_by_file[fname][1:]:
+                            if idx in used_chunk_ids:
+                                continue
+                            sources.append(_make_card(idx, ch))
+                            used_chunk_ids.add(idx)
+                            if len(sources) >= 3:
+                                break
+                        if len(sources) >= 3:
+                            break
+
+                # 3) Third pass: if still < 3, fallback to any other KB files (broad evidence)
+                if len(sources) < 3:
+                    for idx, ch in enumerate(KB_CHUNKS):
+                        if idx in used_chunk_ids:
+                            continue
+                        fname = Path(ch["source"]).name
+                        if fname in used_files:
+                            continue
+                        sources.append(_make_card(idx, ch))
+                        used_files.add(fname)
+                        used_chunk_ids.add(idx)
+                        if len(sources) >= 3:
+                            break
+
+                # Final: assign ranks
+                for r, s in enumerate(sources, start=1):
+                    s["rank"] = r
+
+            t_aud0 = _now_ms()
+            # Audit
+            q_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+            write_audit({
+                "request_id": request_id,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "user_id": user.user_id,
+                "role": user.role,
+                "engine": "tool",
+                "model": None,
+                "prompt_hash": q_hash,
+                "status": "ok",
+                "latency_ms": (t_aud0 - t0),
+                "rag": bool(sources),
+                "rag_k": k,
+                "rag_sources": [s["source"] for s in sources],
+                "tool_used": tool_used,
+            })
+            t_aud1 = _now_ms()
+
+            async with KB_LOCK:
+                kb_files = len({c["source"] for c in KB_CHUNKS})
+                kb_chunks = len(KB_CHUNKS)
+
+            t1 = _now_ms()
+            total_ms = max(1, t1 - t0)
+            audit_ms = max(0, t_aud1 - t_aud0)
+
+            # IMPORTANT: calculate total timing before return
+            timings = {
+                "embed": 0,
+                "retrieve": 0,
+                "llm": 0,
+                "audit": audit_ms,
+                "total": total_ms,
+            }
+
+            return {
+                "request_id": request_id,
+                "status": "ok",
+                "answer": answer,
+                "sources": sources,
+                "tool": {
+                    "used": tool_used,
+                    "result": {
+                        "tool_name": tool_result.tool_name,
+                        "ok": tool_result.ok,
+                        "data": tool_result.data,
+                        "error": tool_result.error,
+                        "citations_hint": getattr(tool_result, "citations_hint", None)
+                    }
+                },
+                "meta": {
+                    "k": k,
+                    "mode": "tool",
+                    "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
+                    "model": None,
+                    "engine": "tool",
+                },
+                "timings_ms": timings,
+                "warnings": warnings,
+                "debug": {"prompt_hash": q_hash, "rag_enabled": False,"evidence_enabled": bool(sources), "tool_used": tool_used},
+            }
+
+        # ----------------------------
+        # 1) RAG retrieval (only if no tool or tool failed)
         # ----------------------------
         t_embed0 = _now_ms()
         async with KB_LOCK:
@@ -611,6 +807,15 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
                 context = "\n\n".join(ctx_parts)
         else:
             warnings.append("KB index is empty or not loaded. Answer may be ungrounded.")
+
+        # tool context (prepend, so model sees it first) - for failed tools only
+        if tool_result is not None and not tool_result.ok and tool_result.error:
+            tool_block = (
+                f"TOOL_ERROR ({tool_used}):\n"
+                f"{tool_result.error}\n"
+                "The tool failed. Answer based on other context if available.\n"
+            )
+            context = tool_block + "\n\n" + context
 
         t_ret1 = _now_ms()
 
@@ -667,10 +872,11 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
             "model": SETTINGS.model,
             "prompt_hash": q_hash,
             "status": "ok",
-            "latency_ms": (t_llm1 - t0),
-            "rag": True,
-            "rag_k": k,
+            "latency_ms": (t_aud0 - t0),
+            "rag": has_kb,
+            "rag_k": k if has_kb else None,
             "rag_sources": list({s.get("source") for s in sources if s.get("source")}),
+            "tool_used": tool_used,
         })
         t_aud1 = _now_ms()
 
@@ -680,13 +886,31 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
 
         t1 = _now_ms()
 
+        # Determine execution mode
+        if tool_used:
+            mode = "tool+llm"  # tool was used but failed, so fell back to LLM
+        elif has_kb:
+            mode = "rag+llm"
+        else:
+            mode = "llm"
+
         return {
             "request_id": request_id,
             "status": "ok",
             "answer": answer_obj,
             "sources": sources,
+            "tool": {
+                "used": tool_used,
+                "result": None if tool_result is None else {
+                    "tool_name": tool_result.tool_name,
+                    "ok": tool_result.ok,
+                    "data": tool_result.data,
+                    "error": tool_result.error,
+                }
+            },
             "meta": {
                 "k": k,
+                "mode": mode,
                 "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
                 "model": SETTINGS.model,
                 "engine": "vllm",

@@ -1,224 +1,327 @@
-# Internal LLM Gateway with Enterprise-Style RAG + Citations
+# Internal LLM Gateway  
+### Enterprise-Style Tool-First RAG System with Secure Access, Audit Logging & Deterministic Business Tools
 
-**An internal-facing LLM Gateway service with secure access control, lightweight RAG retrieval, and enterprise-style citation outputs.**
+An internal-facing LLM Gateway that wraps a raw LLM backend (vLLM) with:
 
-> **Goal:** demonstrate how a raw local LLM endpoint (vLLM) can be engineered into a secure, observable, CI-tested, enterprise-ready gateway system.
+- authentication and role-based access control
+- deterministic business tools
+- retrieval-augmented grounding
+- structured citation outputs
+- audit logging and metrics
+- CI-safe testability
 
----
-
-## Project Overview
-
-This repository implements a production-inspired **internal LLM Gateway architecture**:
-
-- **vLLM** serves the core OpenAI-compatible chat model  
-- A **FastAPI gateway** wraps the model with authentication, audit logging, retrieval, and citations  
-- Internal Markdown documentation forms a lightweight Knowledge Base (KB)  
-- Responses are grounded with structured enterprise-style citation cards  
-
-Rather than exposing a raw model endpoint directly, this project demonstrates how real organizations deploy internal assistants with:
-
-- security controls  
-- grounded answers from internal policy/runbook docs  
-- operational endpoints for KB management  
-- reproducible CI-safe testing without GPUs  
-
----
-## Key Features
-
-### Secure API Access (Auth + Roles)
-
-All endpoints require an API key with role-based access control:
-
-- **User role:** `/ask`  
-- **Admin role:** `/reload_kb`, `/kb_status`  
-
-Unauthorized access returns a clean enterprise-style `403` response.
+> This project demonstrates how real organizations deploy internal AI assistants — not as raw model endpoints, but as secure, observable gateway systems.
 
 ---
 
-### Retrieval-Augmented Generation (RAG)
+# Why This Project Matters
 
-The gateway builds a semantic index over internal documentation:
+Most LLM demos look like this:
 
-- Markdown files under `gateway/kb/`  
-- Chunking with overlap  
-- SentenceTransformer embeddings (`bge-small-en-v1.5`)  
-- Cosine similarity **top-k retrieval**  
+User → Model → Text Output
 
-This ensures answers are grounded in internal sources, not hallucinated.
+Real production systems look like this:
+
+User  
+↓  
+Gateway (Auth + Policy + Tools + RAG + Audit)  
+↓  
+LLM Backend  
+
+This repository implements the gateway layer.
 
 ---
-### Enterprise UI Response Format
 
-The `/ask` endpoint returns a production-style JSON envelope:
+# Core Capabilities
 
-- `request_id`
-- `answer` (summary + steps + confidence)
-- `sources`
-- `meta`
-- `timings_ms`
-- warnings/debug hooks
+## 1) Tool-First Architecture (Deterministic Layer)
+
+Operational queries are routed to deterministic tools before calling the LLM.
 
 Example:
 
-```
-{
-  "request_id": "...",
-  "status": "ok",
-  "answer": {
-    "summary": "...",
-    "steps": ["..."],
-    "confidence": 0.95
-  },
-  "sources": [...],
-  "timings_ms": {...}
-}
-```
-### Operational KB Management
+- "List open Sev-2 incidents" → incident.list_open tool
+- No LLM call
+- No token usage
+- Fully deterministic output
+- Still backed by internal documentation citations
 
-Admins can hot-reload the Knowledge Base (KB) without restarting the service:
-
-```bash
-curl -X POST http://127.0.0.1:8000/reload_kb \
-  -H "x-api-key: dev-admin-key" \
-  -d "{}"
-```
-Status endpoint:
-```
-curl http://127.0.0.1:8000/kb_status \
-  -H "x-api-key: dev-admin-key"
-```
-Returns:
-```
-{
-  "files": 11,
-  "chunks": 44,
-  "emb_shape": [44, 384]
-}
+If the LLM backend is offline:
 
 ```
-This supports operational workflows where documentation can be updated and re-indexed dynamically.
+docker compose stop vllm
+```
 
-### Audit Logging (Privacy-Preserving)
+Tool-based queries continue to function.
 
-The gateway logs all requests with enterprise-style compliance in mind:
+This mirrors real production priorities:
+- reliability
+- cost control
+- deterministic workflows
 
-- `request_id`
-- user identity (`user_id`, role)
-- latency + timing breakdown
-- prompt hash only (no raw text stored)
+Execution modes (auto-selected via routing rules):
 
-This mirrors real internal AI governance requirements, where systems must be observable without retaining sensitive user content.
-
-Audit logs are written under:
-
-- `gateway/artifacts/audit/audit.jsonl`
+- tool        → deterministic business logic only  
+- tool+llm    → tool output enriched with model reasoning  
+- rag+llm     → retrieval grounding + model generation  
+- llm         → direct model invocation  
 
 ---
-### CI-Safe Testing (Pytest + GitHub Actions)
 
-This repository includes full CI testing via GitHub Actions:
+## 2) Retrieval-Augmented Generation (RAG)
 
-- runs on every push / pull request  
-- no GPU required  
-- no external model downloads  
-- vLLM calls are stubbed in tests  
+For knowledge questions, the gateway:
 
-To avoid embedding downloads in CI:
+- indexes Markdown documents under `gateway/kb/`
+- chunks with overlap
+- builds embeddings (SentenceTransformer)
+- performs cosine top-k retrieval
+- injects context into the LLM prompt
 
-- embeddings are lazily loaded  
-- `DISABLE_EMBEDDINGS=1` forces deterministic zero vectors  
+Answers are grounded in internal documentation, reducing hallucination risk.
 
-Run tests locally:
+---
+
+## 3) Enterprise Citation Cards
+
+Responses return structured citation metadata:
+
+```
+{
+"sources": [
+{
+"title": "Incident Response",
+"doc_type": "Runbook",
+"section": "# Severity Levels",
+"score": 1.0,
+"preview": "...",
+"rank": 1
+}
+]
+}
+```
+
+
+Tool-mode citations are intelligently distributed across multiple documents to maximize policy coverage.
+
+---
+
+## 4) Secure Access (Auth + RBAC)
+
+All endpoints require API keys.
+
+Roles:
+
+- user → /ask
+- admin → /reload_kb, /kb_status
+
+Unauthorized access returns structured 403 responses.
+
+---
+
+## 5) Audit Logging (Privacy-Preserving)
+
+Each request logs:
+
+- request_id
+- user_id
+- role
+- latency
+- tool usage
+- prompt hash (not raw prompt)
+
+No sensitive text is stored.
+
+Audit logs:
+
+```
+gateway/artifacts/audit/audit.jsonl
+```
+
+
+This mirrors internal AI governance requirements.
+
+---
+
+## 6) Observability
+
+Prometheus metrics included:
+
+- request counts
+- error types
+- latency histogram
+
+Endpoint:
+
+```
+GET /metrics
+```
+
+
+---
+
+# Architecture Overview
+
+User  
+↓  
+POST /ask  
+↓  
+FastAPI Gateway  
+  - Auth + RBAC  
+  - Rate limiting  
+  - Tool routing  
+  - RAG retrieval  
+  - Citation builder  
+  - Structured JSON envelope  
+↓  
+vLLM (OpenAI-compatible backend)
+
+---
+
+# Repository Structure
+
+```
+llm-internal-assistant/
+│
+├── gateway/
+│ ├── src/app.py
+│ ├── src/tools/
+│ ├── kb/
+│ ├── tests/
+│ ├── requirements.txt
+│ └── Dockerfile
+│
+├── configs/
+│ └── server.example.yaml
+│
+├── docker-compose.yml
+├── pytest.ini
+└── .github/workflows/ci.yml
+```
+
+---
+
+# Running the System
+
+Start services:
+```
+docker compose up -d --build
+```
+
+Health check:
+
+```
+curl http://127.0.0.1:8000/health
+```
+
+---
+
+# Demo Scenarios
+
+## 1) Deterministic Tool Query (LLM Not Required)
+
+Stop the LLM backend (vLLM):
+
+```
+docker compose stop vllm
+```
+Send a tool-routed request (gateway will NOT call the LLM):
+
+```
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/ask" -Method POST `
+  -Headers @{"x-api-key"="dev-user-key"} `
+  -ContentType "application/json" `
+  -Body '{"question":"List open Sev-2 incidents","k":3}' |
+  ConvertTo-Json -Depth 8
+```
+Expected:
+
+meta.engine = tool
+
+timings_ms.llm = 0
+
+sources contains evidence cards even with vLLM offline
+
+---
+
+## 2) Tool + Policy Evidence
+
+Query:
+
+"Show me the SEV-2 checklist"
+
+Returns:
+
+- deterministic checklist steps
+- distributed citation cards across multiple documents
+
+---
+
+## 3) RAG + LLM Knowledge Query
+
+```
+docker compose start vllm
+```
+
+Query:
+
+"Why do we use embeddings?"
+
+Returns:
+
+- grounded citations
+- RAG context injection
+- structured JSON answer
+
+---
+
+# CI-Safe Testing
+
+- No GPU required
+- vLLM calls stubbed
+- Embeddings disabled in CI
+- Deterministic vector fallback
+
+Run locally:
 
 ```
 export PYTHONPATH=gateway
 export DISABLE_EMBEDDINGS=1
 pytest -q
 ```
-These checks ensure that refactoring gateway logic or upgrading dependencies cannot silently break API behavior.
 
-## Architecture Overview
+---
 
-```
-User
- │
- │ POST /ask   (API key required)
- ▼
-Gateway (FastAPI)
- │  ├── Auth + RBAC
- │  ├── Rate limiting
- │  ├── Audit logging (hash only)
- │  ├── KB retrieval (embeddings + cosine top-k)
- │  └── Enterprise JSON response + citations
- ▼
-vLLM Backend (OpenAI-compatible API)
-```
-The gateway retrieves relevant KB chunks, injects them into the prompt context, and returns answers grounded in citations.
+# What This Demonstrates
 
-## Repository Structure
+This project demonstrates:
 
-```
-llm-internal-assistant/
-│
-├── gateway/
-│   ├── src/app.py              # Main FastAPI gateway
-│   ├── kb/                     # Internal KB documents (Markdown)
-│   ├── tests/                  # Pytest suite (CI-safe)
-│   ├── requirements.txt        # Core runtime dependencies
-│   └── Dockerfile              # Containerized gateway
-│
-├── configs/
-│   └── server.example.yaml     # Config template (no secrets)
-│
-├── docker-compose.yml          # vLLM + Gateway stack
-├── pytest.ini                  # Pytest configuration
-└── .github/workflows/ci.yml    # GitHub Actions CI pipeline
-```
-## Running the System (Docker Compose)
+- production-style LLM wrapping
+- secure gateway design
+- deterministic tool routing
+- grounded RAG systems
+- structured response contracts
+- observability and audit logging
+- CI-safe AI engineering patterns
 
-Start both services (Gateway + vLLM backend):
-
-```
-docker compose up -d --build
-```
-Check gateway health:
-```
-curl http://127.0.0.1:8000/health
-```
-
-Expected:
-```
-{"status":"ok"}
-```
-
-## Example Query with Citations
-
-Send a user query to the gateway:
-
-```
-curl -X POST http://127.0.0.1:8000/ask \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: dev-user-key" \
-  -d "{\"question\":\"Why do we need embeddings?\",\"k\":3}"
-```
-The response includes grounded citations retrieved from internal KB documents.
-
-## Project Summary
-
-This project demonstrates applied LLM engineering beyond prompt demos:
-
-- wrapping models with real security + observability  
-- building grounded RAG retrieval pipelines  
-- producing enterprise-ready JSON outputs  
-- supporting operational workflows (reload/status)  
-- implementing CI-safe testing patterns  
-
-It reflects how internal AI assistants are built in real organizations.
+The system remains functional even if the LLM backend is unavailable.
 
 
-## Contact
+# Design Tradeoffs
 
-This repository is part of a personal ML engineering portfolio.
+This system intentionally separates deterministic tools from LLM reasoning.
 
-Feedback and discussion are welcome via GitHub Issues.
+Key decisions:
+
+- Operational workflows must remain functional even if the LLM backend is offline
+- Business-critical queries should not depend on token generation
+- Deterministic tools reduce latency and cost
+- RAG is only invoked when semantic reasoning is required
+
+Embeddings are lazily loaded and can be disabled in CI:
+
+- avoids external downloads
+- ensures deterministic test behavior
+- stabilizes automated pipelines
+
+These constraints reflect real production AI platform engineering tradeoffs.
