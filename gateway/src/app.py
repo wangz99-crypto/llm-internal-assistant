@@ -15,7 +15,7 @@ import httpx
 import yaml
 from fastapi import FastAPI, Header, HTTPException, Request
 from contextlib import asynccontextmanager
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
@@ -492,6 +492,159 @@ if allowed:
         allow_methods=["POST", "GET", "OPTIONS"],
         allow_headers=["Content-Type", "x-api-key"],
     )
+
+
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Internal LLM Gateway – Demo</title>
+  <style>
+    body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;max-width:900px;margin:40px auto;padding:0 16px;line-height:1.5}
+    code,pre{background:#f6f8fa;padding:2px 6px;border-radius:6px}
+    pre{padding:12px;overflow:auto}
+    .card{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin:14px 0}
+    a{color:#2563eb;text-decoration:none}
+    a:hover{text-decoration:underline}
+    .muted{color:#6b7280}
+    .btn{background:#2563eb;color:white;padding:8px 16px;border-radius:6px;border:none;cursor:pointer;font-size:14px}
+    .btn:hover{background:#1d4ed8}
+    .demo-box{background:#f9fafb;border-radius:8px;padding:16px;margin:16px 0}
+    .demo-response{background:#1e293b;color:#e2e8f0;padding:12px;border-radius:6px;font-family:monospace;white-space:pre-wrap;display:none}
+    .loading{display:none;color:#6b7280;margin-left:8px}
+    .error{color:#dc2626}
+  </style>
+</head>
+<body>
+  <h1>🚀 Internal LLM Gateway</h1>
+  <p class="muted">Tool-first architecture + RAG + citations + audit logging. Deployed on Render.</p>
+
+  <div class="card">
+    <h3>📋 Quick Links</h3>
+    <ul>
+      <li><a href="/health">/health</a> (health check)</li>
+      <li><a href="/docs">/docs</a> (interactive API docs)</li>
+      <li><a href="/kb_status">/kb_status</a> (admin-only KB status)</li>
+      <li><a href="/metrics">/metrics</a> (Prometheus metrics)</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>🎮 Live Demo</h3>
+    <p>Try it out instantly:</p>
+    
+    <div class="demo-box">
+      <select id="demo-question" style="width:100%;padding:8px;margin-bottom:8px">
+        <option value="Show me the SEV-2 checklist">📋 Show me the SEV-2 checklist</option>
+        <option value="List open Sev-2 incidents">🔍 List open Sev-2 incidents</option>
+        <option value="Why do we use embeddings?">🤔 Why do we use embeddings?</option>
+        <option value="How should I handle a Sev-1 incident?">🚨 How should I handle a Sev-1 incident?</option>
+      </select>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn" onclick="runDemo()">Run Demo</button>
+        <span class="loading" id="loading">Loading...</span>
+      </div>
+      <div id="response" class="demo-response"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>💻 Example: PowerShell</h3>
+    <pre>Invoke-RestMethod -Uri "https://YOUR-RENDER-URL/ask" -Method POST `
+  -Headers @{"x-api-key"="dev-user-key"} -ContentType "application/json" `
+  -Body '{"question":"Show me the SEV-2 checklist","k":3}' |
+  ConvertTo-Json -Depth 8</pre>
+    <p class="muted">Replace <code>YOUR-RENDER-URL</code> with your deployment domain.</p>
+  </div>
+
+  <div class="card">
+    <h3>💻 Example: cURL</h3>
+    <pre>curl -X POST "https://YOUR-RENDER-URL/ask" \
+  -H "x-api-key: dev-user-key" \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Show me the SEV-2 checklist","k":3}'</pre>
+  </div>
+
+  <div class="card">
+    <h3>🎯 What to try</h3>
+    <ul>
+      <li><strong>Tool mode</strong>: <code>List open Sev-2 incidents</code> (works even if vLLM is down)</li>
+      <li><strong>Tool + evidence</strong>: <code>Show me the SEV-2 checklist</code> (returns structured steps + citations)</li>
+      <li><strong>RAG + LLM</strong>: <code>Why do we use embeddings?</code> (when KB and vLLM are enabled)</li>
+      <li><strong>Admin only</strong>: Check <code>/kb_status</code> to see indexed documents</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>🔧 Environment</h3>
+    <ul>
+      <li>DEMO_MODE: 0 (full functionality)</li>
+      <li>Auth: Enabled (use x-api-key: dev-user-key)</li>
+      <li>Model: Qwen/Qwen2.5-1.5B-Instruct</li>
+      <li>Embeddings: all-MiniLM-L6-v2 (CPU)</li>
+      <li>Rate limits: 30 rpm (user), 120 rpm (admin)</li>
+    </ul>
+  </div>
+
+  <script>
+    async function runDemo() {
+      const question = document.getElementById('demo-question').value;
+      const responseDiv = document.getElementById('response');
+      const loadingSpan = document.getElementById('loading');
+      
+      responseDiv.style.display = 'none';
+      loadingSpan.style.display = 'inline';
+      
+      try {
+        const res = await fetch('/ask', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': 'dev-user-key'
+          },
+          body: JSON.stringify({ question, k: 3 })
+        });
+        
+        const data = await res.json();
+        
+        if (res.ok) {
+          // Pretty print the response
+          const formatted = {
+            request_id: data.request_id,
+            answer: data.answer,
+            sources: data.sources?.map(s => ({
+              source: s.source,
+              title: s.title,
+              score: s.score,
+              preview: s.preview.substring(0, 100) + '...'
+            })),
+            tool: data.tool?.used ? {
+              used: data.tool.used,
+              ok: data.tool.result?.ok
+            } : null,
+            timings_ms: data.timings_ms
+          };
+          
+          responseDiv.textContent = JSON.stringify(formatted, null, 2);
+          responseDiv.style.display = 'block';
+        } else {
+          throw new Error(data.detail || 'Request failed');
+        }
+      } catch (err) {
+        responseDiv.textContent = 'Error: ' + err.message;
+        responseDiv.style.display = 'block';
+      } finally {
+        loadingSpan.style.display = 'none';
+      }
+    }
+  </script>
+</body>
+</html>
+"""
 
 
 @app.post("/reload_kb")
