@@ -1,22 +1,23 @@
 auth:
   enabled: true
   api_keys:
-    - key: "dev-user-key"    
+    - key: "dev-user-key"
+      user_id: "demo-web"
       role: "user"
-    
-    - key: "dev-admin-key"   
+
+    - key: "dev-admin-key"
       user_id: "admin"
       role: "admin"
 
 policy:
-  max_input_chars: 8000
-  max_tokens_default: 256
-  max_tokens_admin: 512
-  rate_limit_rpm_user: 30
-  rate_limit_rpm_admin: 120
-  timeout_seconds: 60
+  max_input_chars: 2000          
+  max_tokens_default: 128        
+  max_tokens_admin: 256
+  rate_limit_rpm_user: 10       
+  rate_limit_rpm_admin: 60
+  timeout_seconds: 30
 
 backend:
-  engine: "vllm"
+  engine: "vllm"                
   model: "Qwen/Qwen2.5-1.5B-Instruct"
-  embedding_model: "BAAI/bge-small-en-v1.5"  
+  embedding_model: "BAAI/bge-small-en-v1.5"
