@@ -202,6 +202,21 @@ def cosine_topk_with_scores(query_vec: np.ndarray, mat: np.ndarray, k: int = 3) 
     return [(int(i), float(sims[i])) for i in idxs]
 
 
+def keyword_topk(question: str, chunks: list[dict], k: int = 3) -> list[tuple[int, float]]:
+    """Keyword-based retrieval for DEMO_MODE (no embeddings, no LLM)."""
+    terms = [t for t in re.findall(r"[A-Za-z0-9_-]{2,}", question.lower())]
+    if not terms:
+        return []
+    scores = []
+    for i, ch in enumerate(chunks):
+        text = (ch.get("text", "") or "").lower()
+        score = sum(text.count(t) for t in terms)
+        if score > 0:
+            scores.append((i, float(score)))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return scores[: max(1, min(k, len(scores)))]
+
+
 def load_settings() -> Settings:
     """
     Load Settings from YAML config.
@@ -1024,28 +1039,62 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         # DEMO MODE: tool-only, no LLM/RAG dependency
         # ----------------------------
         if DEMO_MODE and tool_result is None:
-            # Demo: tool-only, no LLM/RAG dependency
+            # KB keyword retrieval (no embeddings, no LLM)
+            async with KB_LOCK:
+                kb_files = len({c["source"] for c in KB_CHUNKS})
+                kb_chunks = len(KB_CHUNKS)
+                hits = keyword_topk(question, KB_CHUNKS, k=k)
+
+            sources = []
+            ctx_lines = []
+            for rank, (i, score) in enumerate(hits, start=1):
+                ch = KB_CHUNKS[i]
+                card = citation_card(ch, score, i)
+                card["rank"] = rank
+                sources.append(card)
+                section = card.get("section") or ""
+                ctx_lines.append(f"[{rank}] {card['source']} {section}")
+
+            if sources:
+                answer = {
+                    "summary": "Verified answer from internal docs (LLM disabled in public demo).",
+                    "steps": ctx_lines[:8],
+                    "notes": ["Tip: try buttons like SEV-2 checklist / Gateway overview for richer tool outputs."],
+                    "confidence": 0.75,
+                }
+                status_out = "ok"
+                warnings = ["DEMO_MODE=1: LLM disabled; keyword retrieval used"]
+            else:
+                answer = {
+                    "summary": "No internal doc match found (LLM disabled in public demo).",
+                    "steps": [],
+                    "notes": [
+                        "Try: 'Show me the SEV-2 checklist'",
+                        "Try: 'Handle a SEV-1 incident'",
+                        "Try: 'Gateway overview'",
+                        "Try: 'Why do we use embeddings?'"
+                    ],
+                    "confidence": 0.4,
+                }
+                status_out = "ok"
+                warnings = ["DEMO_MODE=1: LLM disabled; no KB match"]
+
             return {
                 "request_id": request_id,
-                "status": "blocked",
-                "answer": {
-                    "summary": "Demo mode is tool-first only. Try: 'Show me the SEV-2 checklist' or 'List open Sev-2 incidents'.",
-                    "steps": [],
-                    "notes": ["DEMO_MODE=1 keeps this demo reliable and cost-free (no LLM calls)."],
-                    "confidence": 0.9
-                },
-                "sources": [],
+                "status": status_out,
+                "answer": answer,
+                "sources": sources,
                 "tool": {"used": None, "result": None},
                 "meta": {
                     "k": k,
-                    "mode": "demo_tool_only",
-                    "kb": {"dir": str(display_source(str(KB_DIR))), "files": 0, "chunks": 0},
+                    "mode": "verified_kb_only",
+                    "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
                     "model": None,
-                    "engine": "tool",
+                    "engine": "kb",
                 },
                 "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": 0, "total": (_now_ms() - t0)},
-                "warnings": ["DEMO_MODE=1: LLM/RAG disabled"],
-                "debug": {"prompt_hash": hashlib.sha256(question.encode("utf-8")).hexdigest()[:16], "rag_enabled": False},
+                "warnings": warnings,
+                "debug": {"prompt_hash": hashlib.sha256(question.encode("utf-8")).hexdigest()[:16], "rag_enabled": True},
             }
 
         # ----------------------------
