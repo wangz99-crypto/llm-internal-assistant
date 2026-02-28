@@ -479,20 +479,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Internal LLM Gateway with RAG", version="0.2.0", lifespan=lifespan)
 
 
-from fastapi.responses import JSONResponse as _JSONResponse
-from fastapi import Request as _Request
-
+# ----------------------------
+# Global exception handler (ensures JSON responses)
+# ----------------------------
 @app.exception_handler(Exception)
-async def _unhandled_exception_handler(request: _Request, exc: Exception):
-    # Always return JSON so the web playground can render errors safely.
+async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled server error")
-    return _JSONResponse(
+    return JSONResponse(
         status_code=500,
-        content={
-            "detail": "Internal Server Error",
-            "error_type": type(exc).__name__,
-        },
+        content={"detail": "Internal Server Error", "error_type": type(exc).__name__},
     )
+
 
 # ----------------------------
 # CORS (for website playground)
@@ -512,185 +509,390 @@ if allowed:
 
 @app.get("/", response_class=HTMLResponse)
 def root():
-    return """
+    return HTMLResponse("""
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Internal LLM Gateway – Demo</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Internal Assistant Playground</title>
   <style>
-    body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;max-width:900px;margin:40px auto;padding:0 16px;line-height:1.5}
-    code,pre{background:#f6f8fa;padding:2px 6px;border-radius:6px}
-    pre{padding:12px;overflow:auto}
-    .card{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin:14px 0}
-    a{color:#2563eb;text-decoration:none}
-    a:hover{text-decoration:underline}
-    .muted{color:#6b7280}
-    .btn{background:#2563eb;color:white;padding:8px 16px;border-radius:6px;border:none;cursor:pointer;font-size:14px}
-    .btn:hover{background:#1d4ed8}
-    .demo-box{background:#f9fafb;border-radius:8px;padding:16px;margin:16px 0}
-    .demo-response{background:#1e293b;color:#e2e8f0;padding:12px;border-radius:6px;font-family:monospace;white-space:pre-wrap;display:none}
-    .loading{display:none;color:#6b7280;margin-left:8px}
-    .error{color:#dc2626}
+    :root{
+      --bg:#0b1220; --panel:#0f172a; --muted:#94a3b8; --text:#e5e7eb;
+      --card:#111c33; --border:rgba(148,163,184,0.18);
+      --btn:#2563eb; --btn2:#334155; --ok:#22c55e; --warn:#f59e0b;
+      --code:#0b1020;
+    }
+    *{box-sizing:border-box;font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}
+    body{margin:0;background:linear-gradient(180deg,#070b14 0%,#0b1220 100%);color:var(--text);}
+    a{color:#93c5fd;text-decoration:none}
+    .wrap{max-width:1100px;margin:0 auto;padding:28px 18px 42px;}
+    .hero{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px;}
+    .title{font-size:22px;font-weight:800;letter-spacing:0.2px;}
+    .sub{color:var(--muted);margin-top:6px;line-height:1.4}
+    .badges{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+    .badge{display:inline-flex;gap:8px;align-items:center;padding:6px 10px;border:1px solid var(--border);
+      background:rgba(17,28,51,0.6);border-radius:999px;color:#cbd5e1;font-size:13px}
+    .dot{width:8px;height:8px;border-radius:50%}
+    .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)}
+    .grid{display:grid;grid-template-columns: 1.15fr 0.85fr;gap:16px;align-items:start;}
+    @media (max-width: 980px){.grid{grid-template-columns:1fr}}
+    .panel{background:rgba(15,23,42,0.82);border:1px solid var(--border);border-radius:16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);overflow:hidden}
+    .panel-h{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+    .panel-h .h{font-weight:800}
+    .panel-b{padding:16px}
+    .muted{color:var(--muted)}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .input, .select, .num{
+      background:rgba(2,6,23,0.6);border:1px solid var(--border);color:var(--text);
+      border-radius:12px;padding:10px 12px;font-size:14px;outline:none;
+    }
+    textarea.input{width:100%;min-height:120px;resize:vertical;line-height:1.45}
+    .select{padding:10px 12px}
+    .num{width:92px}
+    .btn{background:var(--btn);border:none;color:white;padding:10px 14px;border-radius:12px;
+      font-weight:700;cursor:pointer}
+    .btn.secondary{background:var(--btn2)}
+    .btn.ghost{background:transparent;border:1px solid var(--border);color:#cbd5e1}
+    .btn:disabled{opacity:.6;cursor:not-allowed}
+    .try{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}
+    .try .btn{font-size:13px;padding:8px 10px}
+    .pill{font-size:12px;color:#cbd5e1;background:rgba(2,6,23,0.55);border:1px solid var(--border);
+      border-radius:999px;padding:6px 10px}
+    .card{background:rgba(17,28,51,0.65);border:1px solid var(--border);border-radius:14px;padding:12px 12px;margin-top:12px}
+    .card h4{margin:0 0 8px 0;font-size:14px}
+    .kvs{display:grid;grid-template-columns: 150px 1fr;gap:6px 10px;font-size:13px}
+    .kvs div:nth-child(odd){color:var(--muted)}
+    .list{margin:8px 0 0 18px;color:#e2e8f0}
+    .list li{margin:5px 0}
+    .callout{margin-top:12px;padding:10px 12px;border-radius:12px;border:1px solid var(--border);
+      background:rgba(2,6,23,0.45);color:#cbd5e1;font-size:13px;line-height:1.45}
+    details{margin-top:12px}
+    summary{cursor:pointer;color:#cbd5e1;font-weight:700}
+    pre{background:var(--code);border:1px solid var(--border);padding:12px;border-radius:12px;overflow:auto;color:#d1d5db}
+    .small{font-size:12px}
+    .okline{color:#86efac}
+    .warnline{color:#fbbf24}
+    .errline{color:#fca5a5}
+    .spacer{height:8px}
   </style>
 </head>
 <body>
-  <h1>🚀 Internal LLM Gateway</h1>
-  <p class="muted">Tool-first architecture + RAG + citations + audit logging. Deployed on Render.</p>
+  <div class="wrap">
+    <div class="hero">
+      <div>
+        <div class="title">🧩 Internal Assistant — Playground</div>
+        <div class="sub">
+          Product-style demo of an internal assistant that can return <b>grounded</b> answers with sources, run <b>tools/runbooks</b>,
+          and provide <b>auditable traces</b> for each request.
+        </div>
+        <div class="badges">
+          <div class="badge"><span class="dot ok"></span><b>Cited</b> <span class="muted">shows sources</span></div>
+          <div class="badge"><span class="dot ok"></span><b>Tool-assisted</b> <span class="muted">runbooks/checklists</span></div>
+          <div class="badge"><span class="dot ok"></span><b>Auditable</b> <span class="muted">request id + timings</span></div>
+          <div class="badge"><span class="dot warn"></span><b>Hybrid mode</b> <span class="muted">recommended for demos</span></div>
+        </div>
+      </div>
+      <div class="pill">
+        Endpoint: <a href="/docs" target="_blank">/docs</a> · Health: <a href="/health" target="_blank">/health</a>
+      </div>
+    </div>
 
-  <div class="card">
-    <h3>📋 Quick Links</h3>
-    <ul>
-      <li><a href="/health">/health</a> (health check)</li>
-      <li><a href="/docs">/docs</a> (interactive API docs)</li>
-      <li><a href="/kb_status">/kb_status</a> (admin-only KB status)</li>
-      <li><a href="/metrics">/metrics</a> (Prometheus metrics)</li>
-    </ul>
-  </div>
+    <div class="grid">
+      <!-- Left: Playground -->
+      <div class="panel">
+        <div class="panel-h">
+          <div class="h">🎮 Playground</div>
+          <div class="muted small" id="statusLine">Ready</div>
+        </div>
+        <div class="panel-b">
+          <div class="muted small">Ask anything</div>
+          <div class="spacer"></div>
+          <textarea id="q" class="input" placeholder="Try: 'Show me the SEV-2 checklist' or 'How should I handle a Sev-1 incident?'"></textarea>
 
-  <div class="card">
-    <h3>🎮 Live Demo</h3>
-    <p>Try it out instantly:</p>
-    
-    <div class="demo-box">
-      <label class="muted" style="display:block;margin-bottom:6px">Ask anything</label>
-      <textarea id="demo-question" rows="4" style="width:100%;padding:10px;margin-bottom:10px;border-radius:10px;border:1px solid #e5e7eb;resize:vertical"
-        placeholder="Type your question here..."></textarea>
+          <div class="spacer"></div>
+          <div class="row">
+            <label class="muted">k</label>
+            <input id="k" class="num" type="number" min="0" max="8" value="3" />
+            <label class="muted">mode</label>
+            <select id="mode" class="select">
+              <option value="hybrid" selected>Hybrid (recommended)</option>
+              <option value="kb">Verified (KB only)</option>
+              <option value="chat">Chat (LLM)</option>
+            </select>
 
-      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <label class="muted">k
-          <input id="demo-k" type="number" value="3" min="0" max="8" style="width:70px;margin-left:6px;padding:6px;border-radius:10px;border:1px solid #e5e7eb"/>
-        </label>
+            <input id="apiKey" class="input" style="flex:1;min-width:220px" placeholder="x-api-key (optional)" />
+            <button id="askBtn" class="btn" onclick="runAsk()">Ask</button>
+            <button class="btn ghost" onclick="clearUI()">Clear</button>
+          </div>
 
-        <label class="muted">mode
-          <select id="demo-mode" style="margin-left:6px;padding:6px;border-radius:10px;border:1px solid #e5e7eb">
-            <option value="hybrid" selected>hybrid (use KB if available)</option>
-            <option value="kb">kb (context-only)</option>
-            <option value="chat">chat (general)</option>
-          </select>
-        </label>
+          <div class="try">
+            <button class="btn secondary" onclick="quickAsk('Show me the SEV-2 checklist')">SEV-2 checklist</button>
+            <button class="btn secondary" onclick="quickAsk('How should I handle a Sev-1 incident?')">Handle SEV-1</button>
+            <button class="btn secondary" onclick="quickAsk('What does the gateway do? Explain in 5 bullets.')">Gateway overview</button>
+            <button class="btn secondary" onclick="quickAsk('Why do we use embeddings? Explain simply.')">Embeddings (simple)</button>
+          </div>
 
-        <input id="demo-api-key" placeholder="x-api-key (optional)" style="padding:8px;border-radius:10px;border:1px solid #e5e7eb;min-width:220px"/>
-        <button class="btn" onclick="runDemo()">Ask</button>
-        <span class="loading" id="loading">Loading...</span>
+          <div id="friendlyHint" class="callout" style="display:none"></div>
+
+          <!-- Answer -->
+          <div id="answerCard" class="card" style="display:none">
+            <h4>🧠 Answer</h4>
+            <div id="answerBody" class="small"></div>
+          </div>
+
+          <!-- Sources -->
+          <div id="sourcesCard" class="card" style="display:none">
+            <h4>📚 Sources</h4>
+            <div id="sourcesBody" class="small"></div>
+          </div>
+
+          <!-- Technical details -->
+          <details id="techBox" style="display:none">
+            <summary>⚙ Technical details (click to expand)</summary>
+            <div class="spacer"></div>
+            <div id="techMeta" class="small"></div>
+            <div class="spacer"></div>
+            <button class="btn ghost" onclick="copyRaw()">Copy raw JSON</button>
+            <div class="spacer"></div>
+            <pre id="rawJson" class="small"></pre>
+          </details>
+
+          <!-- Error -->
+          <div id="errorBox" class="card" style="display:none">
+            <h4>❗ Error</h4>
+            <pre id="errorText" class="small errline"></pre>
+          </div>
+        </div>
       </div>
 
-      <div id="response" class="demo-response"></div>
+      <!-- Right: How to demo -->
+      <div class="panel">
+        <div class="panel-h">
+          <div class="h">🧭 Demo guide</div>
+          <div class="pill">For non-technical viewers</div>
+        </div>
+        <div class="panel-b">
+          <div class="callout">
+            <b>Suggested demo flow (30–60s)</b>
+            <ol class="list">
+              <li>Click <b>SEV-2 checklist</b> → show steps + sources.</li>
+              <li>Switch mode to <b>Hybrid</b> (default) → ask a general question.</li>
+              <li>Expand <b>Technical details</b> → show request id + timings + tool trace.</li>
+            </ol>
+          </div>
+
+          <div class="card">
+            <h4>Modes (plain English)</h4>
+            <div class="kvs">
+              <div>Hybrid</div><div>Prioritizes internal docs/tools; can still explain if no internal match.</div>
+              <div>Verified</div><div>Only answers using internal context; safest for compliance.</div>
+              <div>Chat</div><div>Free-form Q&A with LLM; may have fewer citations.</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h4>What makes this different</h4>
+            <ul class="list">
+              <li><b>Grounded</b> — shows sources for verification.</li>
+              <li><b>Actionable</b> — can return runbooks/checklists.</li>
+              <li><b>Traceable</b> — auditable request metadata and timings.</li>
+            </ul>
+          </div>
+
+          <div class="card small muted">
+            Tip: If the answer says “tool/KB only”, that means it was generated <b>without calling an LLM</b> — by design, for reliability.
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
-  <div class="card">
-    <h3>💻 Example: PowerShell</h3>
-    <pre>Invoke-RestMethod -Uri "https://YOUR-RENDER-URL/ask" -Method POST `
-  -Headers @{"x-api-key"="dev-user-key"} -ContentType "application/json" `
-  -Body '{"question":"Show me the SEV-2 checklist","k":3,"mode":"hybrid"}' |
-  ConvertTo-Json -Depth 8</pre>
-    <p class="muted">Replace <code>YOUR-RENDER-URL</code> with your deployment domain.</p>
-  </div>
+<script>
+  let LAST_RAW = "";
 
-  <div class="card">
-    <h3>💻 Example: cURL</h3>
-    <pre>curl -X POST "https://YOUR-RENDER-URL/ask" \
-  -H "x-api-key: dev-user-key" \
-  -H "Content-Type: application/json" \
-  -d '{"question":"Show me the SEV-2 checklist","k":3,"mode":"hybrid"}'</pre>
-  </div>
+  function setStatus(msg){ document.getElementById("statusLine").textContent = msg; }
 
-  <div class="card">
-    <h3>🎯 What to try</h3>
-    <ul>
-      <li><strong>Tool mode</strong>: <code>List open Sev-2 incidents</code> (works even if vLLM is down)</li>
-      <li><strong>Tool + evidence</strong>: <code>Show me the SEV-2 checklist</code> (returns structured steps + citations)</li>
-      <li><strong>RAG + LLM</strong>: <code>Why do we use embeddings?</code> (when KB and vLLM are enabled)</li>
-      <li><strong>Admin only</strong>: Check <code>/kb_status</code> to see indexed documents</li>
-    </ul>
-  </div>
+  function clearUI(){
+    document.getElementById("friendlyHint").style.display = "none";
+    document.getElementById("answerCard").style.display = "none";
+    document.getElementById("sourcesCard").style.display = "none";
+    document.getElementById("techBox").style.display = "none";
+    document.getElementById("errorBox").style.display = "none";
+    document.getElementById("answerBody").innerHTML = "";
+    document.getElementById("sourcesBody").innerHTML = "";
+    document.getElementById("techMeta").innerHTML = "";
+    document.getElementById("rawJson").textContent = "";
+    document.getElementById("errorText").textContent = "";
+    LAST_RAW = "";
+    setStatus("Ready");
+  }
 
-  <div class="card">
-    <h3>🔧 Environment</h3>
-    <ul>
-      <li>DEMO_MODE: 0 (full functionality)</li>
-      <li>Auth: Enabled (use x-api-key: dev-user-key)</li>
-      <li>Model: Qwen/Qwen2.5-1.5B-Instruct</li>
-      <li>Embeddings: all-MiniLM-L6-v2 (CPU)</li>
-      <li>Rate limits: 30 rpm (user), 120 rpm (admin)</li>
-    </ul>
-  </div>
+  function quickAsk(text){
+    document.getElementById("q").value = text;
+    runAsk();
+  }
 
-  <script>
-    async function runDemo() {
-      const question = (document.getElementById('demo-question').value || '').trim();
-      const k = Number(document.getElementById('demo-k').value || 3);
-      const mode = (document.getElementById('demo-mode').value || 'hybrid').trim();
-      const apiKey = (document.getElementById('demo-api-key').value || '').trim();
+  function esc(s){
+    return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+  }
 
-      const responseDiv = document.getElementById('response');
-      const loadingSpan = document.getElementById('loading');
+  function renderAnswer(data){
+    const ans = data.answer;
+    const meta = data.meta || {};
+    const engine = (meta.engine || "").toLowerCase();
+    const model = meta.model || null;
 
-      responseDiv.style.display = 'none';
-      loadingSpan.style.display = 'inline';
-
-      try {
-        if (!question) throw new Error('Please enter a question.');
-
-        const headers = {
-          'Content-Type': 'application/json'
-        };
-        if (apiKey) {
-          headers['x-api-key'] = apiKey;
-        } else {
-          // fallback for local/dev demos; safe even if auth is disabled
-          headers['x-api-key'] = 'dev-user-key';
-        }
-
-        const res = await fetch('/ask', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ question, k, mode })
-        });
-
-        // Always read as text first (server might return non-JSON on errors)
-        const text = await res.text();
-        let data = null;
-        try { data = JSON.parse(text); } catch (_) {}
-
-        if (!res.ok) {
-          const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : text;
-          throw new Error(msg || `Request failed (${res.status})`);
-        }
-
-        if (!data) throw new Error('Server returned non-JSON response.');
-
-        const formatted = {
-          request_id: data.request_id,
-          status: data.status,
-          answer: data.answer,
-          sources: (data.sources || []).map(s => ({
-            source: s.source,
-            title: s.title,
-            score: s.score,
-            preview: (s.preview || '').substring(0, 120) + '...'
-          })),
-          tool: data.tool || null,
-          meta: data.meta || null,
-          timings_ms: data.timings_ms || null,
-          warnings: data.warnings || []
-        };
-
-        responseDiv.textContent = JSON.stringify(formatted, null, 2);
-        responseDiv.style.display = 'block';
-      } catch (err) {
-        responseDiv.textContent = 'Error: ' + err.message;
-        responseDiv.style.display = 'block';
-      } finally {
-        loadingSpan.style.display = 'none';
-      }
+    // Friendly hint line (product language)
+    let hint = "";
+    if (engine === "tool" || engine === "kb") {
+      hint = "✅ This answer was generated using internal tools/knowledge (no LLM call).";
+    } else if (!model && engine !== "llm") {
+      hint = "ℹ️ Answer produced without an LLM. Switch to 'Chat (LLM)' if you want free-form responses.";
+    } else {
+      hint = "✨ Hybrid response: internal knowledge + explanation as needed.";
     }
-  </script>
+
+    const hintBox = document.getElementById("friendlyHint");
+    hintBox.innerHTML = esc(hint);
+    hintBox.style.display = "block";
+
+    // Build Answer UI (handles your tool-style object + string)
+    let html = "";
+    if (typeof ans === "string") {
+      html += `<div>${esc(ans)}</div>`;
+    } else if (ans && typeof ans === "object") {
+      if (ans.summary) html += `<div><b>${esc(ans.summary)}</b></div>`;
+      if (Array.isArray(ans.steps) && ans.steps.length){
+        html += `<div class="spacer"></div><div class="muted">Steps</div><ol class="list">` +
+          ans.steps.map(x=>`<li>${esc(x)}</li>`).join("") + `</ol>`;
+      }
+      if (Array.isArray(ans.notes) && ans.notes.length){
+        html += `<div class="spacer"></div><div class="muted">Notes</div><ul class="list">` +
+          ans.notes.map(x=>`<li>${esc(x)}</li>`).join("") + `</ul>`;
+      }
+      if (typeof ans.confidence === "number"){
+        html += `<div class="spacer"></div><div class="muted">Confidence</div><div>${(ans.confidence*100).toFixed(0)}%</div>`;
+      }
+    } else {
+      html += `<div class="muted">No answer payload.</div>`;
+    }
+
+    document.getElementById("answerBody").innerHTML = html;
+    document.getElementById("answerCard").style.display = "block";
+  }
+
+  function renderSources(data){
+    const sources = data.sources || [];
+    if (!sources.length){
+      document.getElementById("sourcesCard").style.display = "none";
+      return;
+    }
+    const html = sources.slice(0,3).map(s=>{
+      const title = s.title ? ` — <span class="muted">${esc(s.title)}</span>` : "";
+      const preview = s.preview ? esc(s.preview) : "";
+      return `<div class="card" style="margin-top:10px">
+        <div><b>${esc(s.source || "source")}</b>${title}</div>
+        <div class="muted small" style="margin-top:6px;white-space:pre-wrap">${preview}</div>
+      </div>`;
+    }).join("");
+    document.getElementById("sourcesBody").innerHTML = html;
+    document.getElementById("sourcesCard").style.display = "block";
+  }
+
+  function renderTech(data){
+    const meta = data.meta || {};
+    const t = data.timings_ms || {};
+    const tool = data.tool || {};
+    const engine = meta.engine || "";
+    const model = meta.model || "—";
+    const rid = data.request_id || "—";
+
+    const metaHtml = `
+      <div class="kvs">
+        <div>request_id</div><div>${esc(rid)}</div>
+        <div>engine</div><div>${esc(engine)}</div>
+        <div>model</div><div>${esc(String(model))}</div>
+        <div>timings</div><div>${esc(JSON.stringify(t))}</div>
+        <div>tool</div><div>${esc(tool.used || "—")}</div>
+      </div>
+    `;
+    document.getElementById("techMeta").innerHTML = metaHtml;
+
+    LAST_RAW = JSON.stringify(data, null, 2);
+    document.getElementById("rawJson").textContent = LAST_RAW;
+    document.getElementById("techBox").style.display = "block";
+  }
+
+  async function copyRaw(){
+    if (!LAST_RAW) return;
+    try{
+      await navigator.clipboard.writeText(LAST_RAW);
+      setStatus("Copied raw JSON ✅");
+      setTimeout(()=>setStatus("Ready"), 1200);
+    }catch(e){
+      setStatus("Copy failed");
+    }
+  }
+
+  async function runAsk(){
+    const q = document.getElementById("q").value.trim();
+    const k = Number(document.getElementById("k").value || 3);
+    const mode = document.getElementById("mode").value;
+    const apiKey = document.getElementById("apiKey").value.trim();
+
+    clearUI();
+    if (!q){
+      document.getElementById("errorBox").style.display = "block";
+      document.getElementById("errorText").textContent = "Please enter a question.";
+      return;
+    }
+
+    const askBtn = document.getElementById("askBtn");
+    askBtn.disabled = true;
+    setStatus("Asking…");
+
+    try{
+      const headers = {"Content-Type":"application/json"};
+      if (apiKey) headers["x-api-key"] = apiKey;
+
+      const res = await fetch("/ask", {
+        method:"POST",
+        headers,
+        body: JSON.stringify({question:q, k:k, mode:mode})
+      });
+
+      // ✅ Always read text first, then try JSON.
+      const text = await res.text();
+      let data = null;
+      try{ data = JSON.parse(text); }catch(_){}
+
+      if (!res.ok){
+        const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : text;
+        throw new Error(msg || `Request failed (${res.status})`);
+      }
+      if (!data) throw new Error("Server returned non-JSON response.");
+
+      renderAnswer(data);
+      renderSources(data);
+      renderTech(data);
+
+      // status summary
+      const eng = (data.meta && data.meta.engine) ? data.meta.engine : "ok";
+      setStatus(`Done · engine=${eng}`);
+    }catch(err){
+      document.getElementById("errorBox").style.display = "block";
+      document.getElementById("errorText").textContent = String(err && err.message ? err.message : err);
+      setStatus("Error");
+    }finally{
+      askBtn.disabled = false;
+    }
+  }
+</script>
 </body>
 </html>
-"""
+    """)
 
 
 @app.post("/reload_kb")
