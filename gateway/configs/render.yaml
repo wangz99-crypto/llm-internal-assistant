@@ -1,0 +1,19 @@
+#Certification related
+AUTH_ENABLED=true
+API_KEYS=[{"key":"dev-user-key","user_id":"demo-web","role":"user"},{"key":"dev-admin-key","user_id":"admin","role":"admin"}]
+
+#Strategy related
+MAX_INPUT_CHARS=2000
+MAX_TOKENS_DEFAULT=128
+MAX_TOKENS_ADMIN=256
+RATE_LIMIT_RPM_USER=10
+RATE_LIMIT_RPM_ADMIN=60
+TIMEOUT_SECONDS=30
+
+#Backend related
+VLLM_BASE_URL= http://your-vllm-service:8001
+MODEL=Qwen/Qwen2.5-1.5B-Instruct
+EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+
+#Other
+DISABLE_EMBEDDINGS=1
