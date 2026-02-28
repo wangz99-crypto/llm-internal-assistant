@@ -478,6 +478,22 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Internal LLM Gateway with RAG", version="0.2.0", lifespan=lifespan)
 
+
+from fastapi.responses import JSONResponse as _JSONResponse
+from fastapi import Request as _Request
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: _Request, exc: Exception):
+    # Always return JSON so the web playground can render errors safely.
+    logger.exception("Unhandled server error")
+    return _JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal Server Error",
+            "error_type": type(exc).__name__,
+        },
+    )
+
 # ----------------------------
 # CORS (for website playground)
 # ----------------------------
@@ -538,16 +554,28 @@ def root():
     <p>Try it out instantly:</p>
     
     <div class="demo-box">
-      <select id="demo-question" style="width:100%;padding:8px;margin-bottom:8px">
-        <option value="Show me the SEV-2 checklist">📋 Show me the SEV-2 checklist</option>
-        <option value="List open Sev-2 incidents">🔍 List open Sev-2 incidents</option>
-        <option value="Why do we use embeddings?">🤔 Why do we use embeddings?</option>
-        <option value="How should I handle a Sev-1 incident?">🚨 How should I handle a Sev-1 incident?</option>
-      </select>
-      <div style="display:flex;gap:8px;align-items:center">
-        <button class="btn" onclick="runDemo()">Run Demo</button>
+      <label class="muted" style="display:block;margin-bottom:6px">Ask anything</label>
+      <textarea id="demo-question" rows="4" style="width:100%;padding:10px;margin-bottom:10px;border-radius:10px;border:1px solid #e5e7eb;resize:vertical"
+        placeholder="Type your question here..."></textarea>
+
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <label class="muted">k
+          <input id="demo-k" type="number" value="3" min="0" max="8" style="width:70px;margin-left:6px;padding:6px;border-radius:10px;border:1px solid #e5e7eb"/>
+        </label>
+
+        <label class="muted">mode
+          <select id="demo-mode" style="margin-left:6px;padding:6px;border-radius:10px;border:1px solid #e5e7eb">
+            <option value="hybrid" selected>hybrid (use KB if available)</option>
+            <option value="kb">kb (context-only)</option>
+            <option value="chat">chat (general)</option>
+          </select>
+        </label>
+
+        <input id="demo-api-key" placeholder="x-api-key (optional)" style="padding:8px;border-radius:10px;border:1px solid #e5e7eb;min-width:220px"/>
+        <button class="btn" onclick="runDemo()">Ask</button>
         <span class="loading" id="loading">Loading...</span>
       </div>
+
       <div id="response" class="demo-response"></div>
     </div>
   </div>
@@ -556,7 +584,7 @@ def root():
     <h3>💻 Example: PowerShell</h3>
     <pre>Invoke-RestMethod -Uri "https://YOUR-RENDER-URL/ask" -Method POST `
   -Headers @{"x-api-key"="dev-user-key"} -ContentType "application/json" `
-  -Body '{"question":"Show me the SEV-2 checklist","k":3}' |
+  -Body '{"question":"Show me the SEV-2 checklist","k":3,"mode":"hybrid"}' |
   ConvertTo-Json -Depth 8</pre>
     <p class="muted">Replace <code>YOUR-RENDER-URL</code> with your deployment domain.</p>
   </div>
@@ -566,7 +594,7 @@ def root():
     <pre>curl -X POST "https://YOUR-RENDER-URL/ask" \
   -H "x-api-key: dev-user-key" \
   -H "Content-Type: application/json" \
-  -d '{"question":"Show me the SEV-2 checklist","k":3}'</pre>
+  -d '{"question":"Show me the SEV-2 checklist","k":3,"mode":"hybrid"}'</pre>
   </div>
 
   <div class="card">
@@ -592,48 +620,66 @@ def root():
 
   <script>
     async function runDemo() {
-      const question = document.getElementById('demo-question').value;
+      const question = (document.getElementById('demo-question').value || '').trim();
+      const k = Number(document.getElementById('demo-k').value || 3);
+      const mode = (document.getElementById('demo-mode').value || 'hybrid').trim();
+      const apiKey = (document.getElementById('demo-api-key').value || '').trim();
+
       const responseDiv = document.getElementById('response');
       const loadingSpan = document.getElementById('loading');
-      
+
       responseDiv.style.display = 'none';
       loadingSpan.style.display = 'inline';
-      
+
       try {
+        if (!question) throw new Error('Please enter a question.');
+
+        const headers = {
+          'Content-Type': 'application/json'
+        };
+        if (apiKey) {
+          headers['x-api-key'] = apiKey;
+        } else {
+          // fallback for local/dev demos; safe even if auth is disabled
+          headers['x-api-key'] = 'dev-user-key';
+        }
+
         const res = await fetch('/ask', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': 'dev-user-key'
-          },
-          body: JSON.stringify({ question, k: 3 })
+          headers,
+          body: JSON.stringify({ question, k, mode })
         });
-        
-        const data = await res.json();
-        
-        if (res.ok) {
-          // Pretty print the response
-          const formatted = {
-            request_id: data.request_id,
-            answer: data.answer,
-            sources: data.sources?.map(s => ({
-              source: s.source,
-              title: s.title,
-              score: s.score,
-              preview: s.preview.substring(0, 100) + '...'
-            })),
-            tool: data.tool?.used ? {
-              used: data.tool.used,
-              ok: data.tool.result?.ok
-            } : null,
-            timings_ms: data.timings_ms
-          };
-          
-          responseDiv.textContent = JSON.stringify(formatted, null, 2);
-          responseDiv.style.display = 'block';
-        } else {
-          throw new Error(data.detail || 'Request failed');
+
+        // Always read as text first (server might return non-JSON on errors)
+        const text = await res.text();
+        let data = null;
+        try { data = JSON.parse(text); } catch (_) {}
+
+        if (!res.ok) {
+          const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : text;
+          throw new Error(msg || `Request failed (${res.status})`);
         }
+
+        if (!data) throw new Error('Server returned non-JSON response.');
+
+        const formatted = {
+          request_id: data.request_id,
+          status: data.status,
+          answer: data.answer,
+          sources: (data.sources || []).map(s => ({
+            source: s.source,
+            title: s.title,
+            score: s.score,
+            preview: (s.preview || '').substring(0, 120) + '...'
+          })),
+          tool: data.tool || null,
+          meta: data.meta || null,
+          timings_ms: data.timings_ms || null,
+          warnings: data.warnings || []
+        };
+
+        responseDiv.textContent = JSON.stringify(formatted, null, 2);
+        responseDiv.style.display = 'block';
       } catch (err) {
         responseDiv.textContent = 'Error: ' + err.message;
         responseDiv.style.display = 'block';
@@ -740,6 +786,9 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         payload = await request.json()
         question = str(payload.get("question", "")).strip()
         k = int(payload.get("k", 3))
+        mode = str(payload.get("mode", "hybrid")).strip().lower()
+        if mode not in ("kb", "hybrid", "chat"):
+            raise HTTPException(status_code=400, detail="Invalid mode. Use: kb | hybrid | chat.")
 
         if not question:
             status = "blocked"
@@ -1017,21 +1066,45 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         # ----------------------------
         # 2) LLM call (force UI JSON)
         # ----------------------------
-        system_prompt = (
-            "You are a helpful internal assistant.\n"
-            "Use the provided Internal Context when relevant.\n"
-            "Return STRICT JSON only (no markdown, no code fences) with EXACT keys:\n"
-            "- summary: string\n"
-            "- steps: array of strings\n"
-            "- notes: array of strings\n"
-            "- confidence: number between 0 and 1\n"
-            "If the answer is not in the context, say you are not sure in summary and keep steps empty.\n"
-            "Do not include any extra keys."
-        )
+        # Mode controls how strictly we rely on retrieved context.
+        if mode == "kb":
+            system_prompt = (
+                "You are a helpful internal assistant.\n"
+                "You MUST rely only on the provided Internal Context.\n"
+                "Return STRICT JSON only (no markdown, no code fences) with EXACT keys:\n"
+                "- summary: string\n"
+                "- steps: array of strings\n"
+                "- notes: array of strings\n"
+                "- confidence: number between 0 and 1\n"
+                "If the answer is not in the context, say you are not sure in summary and keep steps empty.\n"
+                "Do not include any extra keys."
+            )
+        elif mode == "chat":
+            system_prompt = (
+                "You are a helpful assistant.\n"
+                "Return STRICT JSON only (no markdown, no code fences) with EXACT keys:\n"
+                "- summary: string\n"
+                "- steps: array of strings\n"
+                "- notes: array of strings\n"
+                "- confidence: number between 0 and 1\n"
+                "Do not include any extra keys."
+            )
+        else:  # hybrid
+            system_prompt = (
+                "You are a helpful internal assistant.\n"
+                "Use the provided Internal Context when it is relevant. If no context is provided, answer normally.\n"
+                "Return STRICT JSON only (no markdown, no code fences) with EXACT keys:\n"
+                "- summary: string\n"
+                "- steps: array of strings\n"
+                "- notes: array of strings\n"
+                "- confidence: number between 0 and 1\n"
+                "If you did not use any Internal Context, mention that in notes.\n"
+                "Do not include any extra keys."
+            )
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Question:\n{question}\n\nInternal Context:\n{context}"},
+            {"role": "user", "content": (f"Question:\n{question}\n\nInternal Context:\n{context}" if mode != "chat" else f"Question:\n{question}")},
         ]
 
         url = f"{SETTINGS.vllm_base_url}/v1/chat/completions"
@@ -1052,6 +1125,13 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
 
         raw_answer = out["choices"][0]["message"]["content"]
         answer_obj = safe_parse_ui_json(raw_answer)
+
+        if mode == "hybrid" and not sources:
+            # Make it explicit when we answered without internal citations.
+            answer_obj.setdefault("notes", [])
+            if isinstance(answer_obj["notes"], list):
+                answer_obj["notes"].append("No internal KB sources were retrieved for this question; answer may be general.")
+
 
         # ----------------------------
         # 3) Audit (no raw prompt)
