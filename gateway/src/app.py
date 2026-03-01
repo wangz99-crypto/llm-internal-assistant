@@ -75,6 +75,10 @@ KB_CHUNKS: list[dict] = []
 KB_EMB: np.ndarray | None = None
 
 
+# Move _ws definition BEFORE any function that uses it (clean_preview)
+_ws = re.compile(r"\s+")
+
+
 def chunk_text(text: str, max_chars: int = 320, overlap: int = 80) -> list[tuple[str, int]]:
     """
     Return list of (chunk_text, start_offset).
@@ -202,17 +206,66 @@ def cosine_topk_with_scores(query_vec: np.ndarray, mat: np.ndarray, k: int = 3) 
     return [(int(i), float(sims[i])) for i in idxs]
 
 
+# STOPWORDS: added summarize, bullets, policy to reduce noise
+STOPWORDS = {
+    "the","a","an","to","of","and","or","in","on","for","with","is","are","be","as",
+    "i","we","you","me","my","our","your","this","that","it","they","their",
+    "what","why","how","should","do","does","first","please","give","explain","simply",
+    "summarize","bullets","policy",  # added to prevent faq_ops from being boosted accidentally
+}
+
+# query -> preferred kb files (stability for demo)
+# Stronger, broader escalation regex and higher boost
+QUERY_FILE_BOOST = [
+    (re.compile(r"\bescalat|\bsev\b|\bseverity\b|\bincident\b|\bpolicy\b", re.I),
+     {"escalation_policy.md": 8.0, "incident_response.md": 3.0}),  # escalation gets huge boost
+    (re.compile(r"\baudit\b|\blog\b|\btrace\b", re.I), {"audit_and_access.md": 4.0}),
+    (re.compile(r"\bsev[- ]?1\b|\bsev[- ]?2\b|\boutage\b|\bincident\b|\bdisruption\b", re.I), {"incident_response.md": 3.0, "runbook.md": 2.0}),
+    (re.compile(r"\bgateway\b|\brequest flow\b|\barchitecture\b", re.I), {"architecture_overview.md": 3.0}),
+    (re.compile(r"\bverified\b|\bhybrid\b|\bmode\b", re.I), {"knowledge_usage_guidelines.md": 3.0}),
+]
+
+def _tokens(question: str) -> list[str]:
+    raw = re.findall(r"[A-Za-z0-9_-]{2,}", (question or "").lower())
+    toks = [t for t in raw if t not in STOPWORDS]
+    return toks[:24]
+
 def keyword_topk(question: str, chunks: list[dict], k: int = 3) -> list[tuple[int, float]]:
-    """Keyword-based retrieval for DEMO_MODE (no embeddings, no LLM)."""
-    terms = [t for t in re.findall(r"[A-Za-z0-9_-]{2,}", question.lower())]
+    terms = _tokens(question)
     if not terms:
         return []
-    scores = []
+
+    scores: list[tuple[int, float]] = []
+    q = question or ""
+
     for i, ch in enumerate(chunks):
         text = (ch.get("text", "") or "").lower()
-        score = sum(text.count(t) for t in terms)
-        if score > 0:
-            scores.append((i, float(score)))
+        if not text:
+            continue
+
+        # base score: term frequency
+        base = 0.0
+        for t in terms:
+            c = text.count(t)
+            if c:
+                base += min(3, c)  # cap
+        if base <= 0:
+            continue
+
+        # section/title bonus (markdown headings are informative)
+        section = (ch.get("section") or "").lower()
+        for t in terms:
+            if t in section:
+                base += 1.2
+
+        # file boosts for demo stability
+        fname = Path(ch.get("source", "")).name
+        for rx, boosts in QUERY_FILE_BOOST:
+            if rx.search(q):
+                base += boosts.get(fname, 0.0)
+
+        scores.append((i, base))
+
     scores.sort(key=lambda x: x[1], reverse=True)
     return scores[: max(1, min(k, len(scores)))]
 
@@ -293,6 +346,78 @@ DEMO_ADMIN_KEY = os.getenv("DEMO_ADMIN_KEY", "dev-admin-key")
 DEMO_COOKIE_NAME = "demo_key"
 
 
+# ----------------------------
+# Demo Script (100% deterministic)
+# ----------------------------
+DEMO_SCRIPT_ENABLED = os.getenv("DEMO_SCRIPT", "1") == "1"  # default ON in demo
+
+DEMO_SCENARIOS = {
+    # TOOL-FIRST (always stable)
+    "sev2_checklist": {
+        "label": "Runbook: SEV-2 checklist (tool)",
+        "canonical_question": "Show me the SEV-2 checklist",
+        "force_engine": "tool",
+        "force_tool": ("runbook.get_checklist", {"sev": 2}),
+    },
+
+    # KB-LOCKED (always hit the correct doc)
+    "escalation_policy": {
+        "label": "Policy: Escalation policy (KB)",
+        "canonical_question": "Summarize the escalation policy in 5 bullets.",
+        "force_engine": "kb_demo",
+        "force_file": "escalation_policy.md",
+    },
+    "audit_logging": {
+        "label": "Governance: What gets logged for audit and why? (KB)",
+        "canonical_question": "What gets logged for audit and why?",
+        "force_engine": "kb_demo",
+        "force_file": "audit_and_access.md",
+    },
+    "sev1_response": {
+        "label": "Incident: Handle SEV-1 (KB)",
+        "canonical_question": "How should I handle a Sev-1 incident?",
+        "force_engine": "kb_demo",
+        "force_file": "incident_playbook_sev1.md",
+    },
+    "customer_outage_first": {
+        "label": "Ops: Customer outage—what should I do first? (KB)",
+        "canonical_question": "I have a service outage affecting customers. What should I do first?",
+        "force_engine": "kb_demo",
+        "force_file": "incident_response.md",
+    },
+    "customer_update_template": {
+        "label": "Comms: Draft customer update (KB template)",
+        "canonical_question": "Draft a customer update for a service disruption.",
+        "force_engine": "kb_demo",
+        "force_file": "incident_comms_templates.md",
+    },
+    "modes_guidance": {
+        "label": "Usage: When should I use Verified vs Hybrid? (KB)",
+        "canonical_question": "When should I use Verified vs Hybrid?",
+        "force_engine": "kb_demo",
+        "force_file": "knowledge_usage_guidelines.md",
+    },
+    "architecture_overview": {
+        "label": "System: Architecture overview (KB)",
+        "canonical_question": "Explain the gateway architecture and request flow in 6 bullets.",
+        "force_engine": "kb_demo",
+        "force_file": "architecture_overview.md",
+    },
+    "security_controls": {
+        "label": "Security: Key controls (KB)",
+        "canonical_question": "Summarize the security controls in 6 bullets.",
+        "force_engine": "kb_demo",
+        "force_file": "security_controls.md",
+    },
+    "product_overview": {
+        "label": "Product: What is this system? (KB)",
+        "canonical_question": "Give a concise product overview and the main guarantees.",
+        "force_engine": "kb_demo",
+        "force_file": "product_overview.md",
+    },
+}
+
+
 def resolve_api_key(x_api_key: Optional[str], request: Optional[Request]) -> Optional[str]:
     # Prefer explicit header
     if x_api_key:
@@ -313,7 +438,7 @@ def auth_user(x_api_key: Optional[str], request: Optional[Request] = None) -> Ap
 
     key = resolve_api_key(x_api_key, request)
 
-    # ✅ Demo mode: if no key provided, treat as admin (for public product demo)
+    # Demo mode: if no key provided, treat as admin (for public product demo)
     if DEMO_MODE and not key:
         return ApiKeyUser(user_id="demo", role="admin")
 
@@ -468,8 +593,6 @@ async def build_kb_index() -> None:
 # ----------------------------
 # privacy-preserving hash
 # ----------------------------
-_ws = re.compile(r"\s+")
-
 
 def compute_prompt_hash(messages: list[dict]) -> str:
     parts = []
@@ -545,15 +668,63 @@ if allowed:
     )
 
 
+# 🔧 Patch 1 & 2: /demo endpoint now reads from DEMO_SCENARIOS
+@app.get("/demo")
+def demo_scenarios():
+    return {
+        "title": "Enterprise Gateway Demo Scenarios",
+        "script_enabled": DEMO_SCRIPT_ENABLED,
+        "scenarios": [
+            {"id": sid, "label": cfg["label"], "question": cfg["canonical_question"]}
+            for sid, cfg in DEMO_SCENARIOS.items()
+        ],
+    }
+
+
+# Helper for template-based answers in demo mode (enterprise-style)
+def demo_template_answer(question: str, steps: list[str], sources: list[dict]) -> dict:
+    q = (question or "").lower()
+
+    # label by intent (enterprise-style)
+    if "sev-2" in q or "sev2" in q or "checklist" in q:
+        title = "Runbook result (deterministic)."
+        notes = ["This is a tool-first workflow: no LLM required."]
+    elif "audit" in q or "logged" in q:
+        title = "Governance answer (source-backed)."
+        notes = ["Audit fields are policy-controlled and privacy-preserving."]
+    elif "draft" in q or "customer update" in q:
+        title = "Template retrieved (source-backed)."
+        notes = ["In private deployments, the LLM can rewrite tone/length while keeping the same citations."]
+    elif "escalation" in q or "policy" in q:
+        title = "Policy summary (source-backed)."
+        notes = ["In public demo, summarization is deterministic; private mode adds LLM reasoning."]
+    else:
+        title = "Source-backed deterministic answer."
+        notes = ["This hosted demo runs with LLM disabled to emphasize reliability and governance."]
+
+    # stable “top evidence” line
+    if sources:
+        top = sources[0]
+        sec = top.get("section") or ""
+        notes.insert(0, f"Top evidence: {top.get('source')} {sec}".strip())
+
+    return {
+        "summary": title,
+        "steps": steps[:8] if steps else ["Open Sources below to review the exact matched internal snippet."],
+        "notes": notes[:4],
+        "confidence": 0.75 if steps else 0.55,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
-def root():
+async def root(request: Request):
     html = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Internal Assistant Playground</title>
+  <title>Internal Assistant — Governance-First AI System</title>
   <style>
     :root{
       --bg:#0b1220; --panel:#0f172a; --muted:#94a3b8; --text:#e5e7eb;
@@ -620,16 +791,18 @@ def root():
   <div class="wrap">
     <div class="hero">
       <div>
-        <div class="title">🧩 Internal Assistant — Playground</div>
+        <!-- Landing area with more product-oriented language -->
+        <div class="title">🧩 Internal Assistant — Governance-First AI System</div>
         <div class="sub">
-          Product-style demo of an internal assistant that can return <b>grounded</b> answers with sources, run <b>tools/runbooks</b>,
-          and provide <b>auditable traces</b> for each request.
+          A system-oriented assistant that delivers <b>source-backed answers</b>,
+          <b>action-ready runbooks</b>, and <b>auditable request traces</b>.
+          Designed for reliability, compliance, and operational clarity.
         </div>
         <div class="badges">
-          <div class="badge"><span class="dot ok"></span><b>Cited</b> <span class="muted">shows sources</span></div>
-          <div class="badge"><span class="dot ok"></span><b>Tool-assisted</b> <span class="muted">runbooks/checklists</span></div>
-          <div class="badge"><span class="dot ok"></span><b>Auditable</b> <span class="muted">request id + timings</span></div>
-          <div class="badge"><span class="dot warn"></span><b>Hybrid mode</b> <span class="muted">recommended for demos</span></div>
+          <div class="badge"><span class="dot ok"></span><b>Source-backed</b> <span class="muted">verify before acting</span></div>
+          <div class="badge"><span class="dot ok"></span><b>Action steps</b> <span class="muted">runbooks & checklists</span></div>
+          <div class="badge"><span class="dot ok"></span><b>Audit-ready</b> <span class="muted">request id + timings</span></div>
+          <div class="badge"><span class="dot warn"></span><b>Hybrid</b> <span class="muted">best default mode</span></div>
         </div>
       </div>
       <div class="pill">
@@ -638,29 +811,34 @@ def root():
     </div>
 
     <div class="grid">
-      <!-- Left: Playground -->
+      <!-- Left: Playground (renamed to Demo Runner) -->
       <div class="panel">
         <div class="panel-h">
-          <div class="h">🎮 Playground</div>
+          <div class="h">🎬 Demo Runner</div>
           <div class="muted small" id="statusLine">Ready</div>
         </div>
         <div class="panel-b">
-          <div class="muted small">Ask anything</div>
+          <div class="muted small">Pick a scenario below. This hosted demo runs in deterministic mode (LLM disabled) to showcase reliability, evidence, and auditability.</div>
           <div class="spacer"></div>
-          <textarea id="q" class="input" placeholder="Try: 'Show me the SEV-2 checklist' or 'How should I handle a Sev-1 incident?'"></textarea>
+          <textarea id="q" class="input" placeholder="Scenario question will appear here" readonly></textarea>
 
-          <!-- Quick preset dropdown -->
+          <!-- Quick preset dropdown (now using scenario_id) -->
           <div class="row" style="margin-top:10px">
-            <span class="muted small">Quick questions</span>
+            <span class="muted small">Select scenario</span>
             <select id="preset" class="select" style="flex:1;min-width:260px">
-              <option value="">Select an example…</option>
-              <option value="Show me the SEV-2 checklist">SEV-2 checklist (runbook)</option>
-              <option value="How should I handle a Sev-1 incident?">SEV-1 response (incident)</option>
-              <option value="What does the gateway do? Explain in 5 bullets.">What is the gateway?</option>
-              <option value="Why do we use embeddings? Explain simply.">Embeddings explained</option>
-              <option value="What are the security controls? Give a short summary.">Security controls</option>
+              <option value="">— Choose a scenario —</option>
+              <option value="sev2_checklist">SEV-2 checklist (runbook)</option>
+              <option value="sev1_response">SEV-1 response (incident)</option>
+              <option value="escalation_policy">Escalation policy</option>
+              <option value="customer_outage_first">Customer outage scenario</option>
+              <option value="customer_update_template">Customer update draft</option>
+              <option value="audit_logging">Audit logging overview</option>
+              <option value="modes_guidance">Usage guidance</option>
+              <option value="architecture_overview">Architecture overview</option>
+              <option value="security_controls">Security controls</option>
+              <option value="product_overview">Product overview</option>
             </select>
-            <button class="btn secondary" onclick="applyPreset()">Insert</button>
+            <button class="btn secondary" onclick="applyPreset()">Load</button>
           </div>
 
           <div class="spacer"></div>
@@ -671,18 +849,21 @@ def root():
             <select id="mode" class="select">
               <option value="hybrid" selected>Hybrid (recommended)</option>
               <option value="kb">Verified (KB only)</option>
-              <option value="chat">Chat (LLM)</option>
+              <option value="chat">Assist: In private deployment, LLM-backed rewriting is enabled; hosted demo focuses on governance-first behavior.</option>
             </select>
 
-            <button id="askBtn" class="btn" onclick="runAsk()">Ask</button>
+            <button id="askBtn" class="btn" onclick="runAsk()">Run scenario</button>
             <button class="btn ghost" onclick="clearUI()">Clear</button>
           </div>
 
           <div class="try">
-            <button class="btn secondary" onclick="quickAsk('Show me the SEV-2 checklist')">SEV-2 checklist</button>
-            <button class="btn secondary" onclick="quickAsk('How should I handle a Sev-1 incident?')">Handle SEV-1</button>
-            <button class="btn secondary" onclick="quickAsk('What does the gateway do? Explain in 5 bullets.')">Gateway overview</button>
-            <button class="btn secondary" onclick="quickAsk('Why do we use embeddings? Explain simply.')">Embeddings (simple)</button>
+            <button class="btn secondary" onclick="quickAskScenario('escalation_policy')">Escalation policy</button>
+            <button class="btn secondary" onclick="quickAskScenario('customer_outage_first')">Customer outage</button>
+            <button class="btn secondary" onclick="quickAskScenario('sev2_checklist')">SEV-2 checklist</button>
+            <button class="btn secondary" onclick="quickAskScenario('sev1_response')">Handle SEV-1</button>
+            <button class="btn secondary" onclick="quickAskScenario('customer_update_template')">Customer update</button>
+            <button class="btn secondary" onclick="quickAskScenario('audit_logging')">Audit logging</button>
+            <button class="btn secondary" onclick="quickAskScenario('modes_guidance')">Usage guidance</button>
           </div>
 
           <div id="friendlyHint" class="callout" style="display:none"></div>
@@ -699,9 +880,9 @@ def root():
             <div id="sourcesBody" class="small"></div>
           </div>
 
-          <!-- Technical details -->
+          <!-- Request details -->
           <details id="techBox" style="display:none">
-            <summary>⚙ Technical details (click to expand)</summary>
+            <summary>🧾 Request details (click to expand)</summary>
             <div class="spacer"></div>
             <div id="techMeta" class="small"></div>
             <div class="spacer"></div>
@@ -718,42 +899,59 @@ def root():
         </div>
       </div>
 
-      <!-- Right: How to demo -->
+      <!-- Right: How to use -->
       <div class="panel">
         <div class="panel-h">
-          <div class="h">🧭 Demo guide</div>
-          <div class="pill">For non-technical viewers</div>
+          <div class="h">🧭 How to use</div>
+          <div class="pill">Quick guidance</div>
         </div>
         <div class="panel-b">
           <div class="callout">
-            <b>Suggested demo flow (30–60s)</b>
+            <b>Usage tips</b>
             <ol class="list">
-              <li>Click <b>SEV-2 checklist</b> → show steps + sources.</li>
-              <li>Switch mode to <b>Hybrid</b> (default) → ask a general question.</li>
-              <li>Expand <b>Technical details</b> → show request id + timings + tool trace.</li>
+              <li>Start with <b>SEV-2 checklist</b> to see an actionable, step-by-step response with sources.</li>
+              <li>Ask a general question in <b>Hybrid</b> mode to get the best balance of internal knowledge + explanation.</li>
+              <li>Open <b>Request details</b> to view an audit-friendly record (request id + timings).</li>
             </ol>
           </div>
 
           <div class="card">
             <h4>Modes (plain English)</h4>
             <div class="kvs">
-              <div>Hybrid</div><div>Prioritizes internal docs/tools; can still explain if no internal match.</div>
-              <div>Verified</div><div>Only answers using internal context; safest for compliance.</div>
-              <div>Chat</div><div>Free-form Q&A with LLM; may have fewer citations.</div>
+              <div>Hybrid</div>
+              <div><b>Best for most questions.</b> Uses internal knowledge first; adds a clear explanation when needed.</div>
+
+              <div>Verified</div>
+              <div><b>Best for compliance.</b> Answers only when internal sources support the response.</div>
+
+              <div>Assist</div>
+              <div><b>Best for drafting.</b> More free-form help. (In this hosted demo, advanced LLM is limited; a GPU-backed version is available in private deployment.)</div>
             </div>
           </div>
 
           <div class="card">
-            <h4>What makes this different</h4>
+            <h4>Business value</h4>
+            <!-- Enhanced Business value block -->
             <ul class="list">
-              <li><b>Grounded</b> — shows sources for verification.</li>
-              <li><b>Actionable</b> — can return runbooks/checklists.</li>
-              <li><b>Traceable</b> — auditable request metadata and timings.</li>
+              <li><b>Operational clarity</b> — structured steps reduce ambiguity during incidents.</li>
+              <li><b>Risk reduction</b> — answers are grounded in internal policies before action.</li>
+              <li><b>Governance-first design</b> — every request is traceable and reviewable.</li>
             </ul>
           </div>
 
           <div class="card small muted">
-            Tip: If the answer says “tool/KB only”, that means it was generated <b>without calling an LLM</b> — by design, for reliability.
+            This demo focuses on reliability and traceability. In a private environment, the same design supports a GPU-backed LLM for richer reasoning while keeping the same safety controls.
+          </div>
+          <!-- Project highlights card (interview-friendly) -->
+          <div class="card">
+            <h4>Project highlights</h4>
+            <ul class="list">
+              <li>Retrieval + verification architecture</li>
+              <li>Mode-based response strategy (Verified / Hybrid / Assist)</li>
+              <li>Structured runbook outputs</li>
+              <li>Audit-friendly logging (JSONL)</li>
+              <li>Tool routing for deterministic workflows</li>
+            </ul>
           </div>
         </div>
       </div>
@@ -761,6 +959,22 @@ def root():
   </div>
 
 <script>
+  let DEMO_MAP = {};      // scenario_id -> {label, question}
+  let SELECTED_SCENARIO = "";
+
+  async function loadDemoScenarios(){
+    try{
+      const r = await fetch("/demo");
+      const j = await r.json();
+      (j.scenarios || []).forEach(s => { DEMO_MAP[s.id] = s; });
+    }catch(e){
+      // ignore
+    }
+  }
+
+  // call on page load
+  loadDemoScenarios();
+
   let LAST_RAW = "";
 
   function setStatus(msg){ document.getElementById("statusLine").textContent = msg; }
@@ -780,19 +994,37 @@ def root():
     setStatus("Ready");
   }
 
-  function quickAsk(text){
-    document.getElementById("q").value = text;
+  function quickAskScenario(sid){
+    SELECTED_SCENARIO = sid;
+    const item = DEMO_MAP[sid];
+    document.getElementById("q").value = (item && item.question) ? item.question : `Scenario: ${sid}`;
     runAsk();
   }
 
   function applyPreset(){
-    const v = document.getElementById("preset").value;
-    if (!v) return;
-    document.getElementById("q").value = v;
+    const sid = document.getElementById("preset").value;
+    if (!sid) return;
+
+    SELECTED_SCENARIO = sid;
+
+    const item = DEMO_MAP[sid];
+    if (item && item.question){
+      document.getElementById("q").value = item.question;
+    } else {
+      // fallback: show id if demo endpoint not loaded
+      document.getElementById("q").value = `Scenario: ${sid}`;
+    }
   }
 
   function esc(s){
     return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+  }
+
+  function confLabel(x){
+    if (typeof x !== "number") return null;
+    if (x >= 0.8) return "High";
+    if (x >= 0.55) return "Medium";
+    return "Low";
   }
 
   function renderAnswer(data){
@@ -803,12 +1035,11 @@ def root():
 
     // Friendly hint line (product language)
     let hint = "";
+    // Enhanced product capability hint
     if (engine === "tool" || engine === "kb") {
-      hint = "✅ This answer was generated using internal tools/knowledge (no LLM call).";
-    } else if (!model && engine !== "llm") {
-      hint = "ℹ️ Answer produced without an LLM. Switch to 'Chat (LLM)' if you want free-form responses.";
+      hint = "✅ Source-backed result — grounded in internal policies and runbooks.";
     } else {
-      hint = "✨ Hybrid response: internal knowledge + explanation as needed.";
+      hint = "✨ Best-effort explanation: combines internal context (when available) with a clear summary.";
     }
 
     const hintBox = document.getElementById("friendlyHint");
@@ -829,8 +1060,9 @@ def root():
         html += `<div class="spacer"></div><div class="muted">Notes</div><ul class="list">` +
           ans.notes.map(x=>`<li>${esc(x)}</li>`).join("") + `</ul>`;
       }
-      if (typeof ans.confidence === "number"){
-        html += `<div class="spacer"></div><div class="muted">Confidence</div><div>${(ans.confidence*100).toFixed(0)}%</div>`;
+      const cl = confLabel(ans.confidence);
+      if (cl){
+        html += `<div class="spacer"></div><div class="muted">Confidence</div><div>${esc(cl)}</div>`;
       }
     } else {
       html += `<div class="muted">No answer payload.</div>`;
@@ -898,16 +1130,19 @@ def root():
     const k = Number(document.getElementById("k").value || 3);
     const mode = document.getElementById("mode").value;
 
-    clearUI();
-    if (!q){
+    const scenarioId = SELECTED_SCENARIO || document.getElementById("preset").value || "";
+
+    if (!scenarioId){
       document.getElementById("errorBox").style.display = "block";
-      document.getElementById("errorText").textContent = "Please enter a question.";
+      document.getElementById("errorText").textContent = "Please select a demo scenario.";
       return;
     }
 
+    clearUI();
+
     const askBtn = document.getElementById("askBtn");
     askBtn.disabled = true;
-    setStatus("Asking…");
+    setStatus("Running scenario…");
 
     try{
       const headers = {"Content-Type":"application/json"};
@@ -916,10 +1151,10 @@ def root():
       const res = await fetch("/ask", {
         method:"POST",
         headers,
-        body: JSON.stringify({question:q, k:k, mode:mode})
+        body: JSON.stringify({ scenario_id: scenarioId, k:k, mode:mode })
       });
 
-      // ✅ Always read text first, then try JSON.
+      // Always read text first, then try JSON.
       const text = await res.text();
       let data = null;
       try{ data = JSON.parse(text); }catch(_){}
@@ -951,14 +1186,21 @@ def root():
     """
     resp = HTMLResponse(html)
     
-    # ✅ Set demo cookie (HttpOnly) so browser carries it automatically
+    # Set demo cookie (HttpOnly) so browser carries it automatically
     if DEMO_MODE:
+        # Determine if request is HTTPS to set secure flag appropriately
+        is_https = True
+        try:
+            is_https = (request.url.scheme == "https")
+        except Exception:
+            pass
+
         resp.set_cookie(
             key=DEMO_COOKIE_NAME,
             value=DEMO_ADMIN_KEY,
             httponly=True,
             samesite="lax",
-            secure=True,  # Render is https
+            secure=is_https,  # Only secure if actual connection is HTTPS
             max_age=60 * 60 * 24 * 7,
         )
     return resp
@@ -1061,16 +1303,31 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         if mode not in ("kb", "hybrid", "chat"):
             raise HTTPException(status_code=400, detail="Invalid mode. Use: kb | hybrid | chat.")
 
-        # ✅ Demo mode: fallback from chat to hybrid
+        warnings: list[str] = []  # move warnings up here
+
+        # Public demo: "chat" becomes hybrid (LLM may be disabled)
         if DEMO_MODE and mode == "chat":
-            warnings.append("Public demo: LLM disabled. Falling back to Hybrid.")
+            warnings.append("Public demo: advanced LLM is not enabled in this hosted demo; switching to Hybrid.")
             mode = "hybrid"
+
+        # 🔧 Patch 3: DEMO_SCRIPT mode forces scenario_id and canonical question
+        forced_file = None
+        forced_tool = None
+
+        if DEMO_MODE and DEMO_SCRIPT_ENABLED:
+            scenario_id = str(payload.get("scenario_id", "")).strip() or None
+            if not scenario_id or scenario_id not in DEMO_SCENARIOS:
+                raise HTTPException(status_code=400, detail="DEMO_SCRIPT enabled: select a scenario (scenario_id).")
+
+            sc = DEMO_SCENARIOS[scenario_id]
+            question = sc["canonical_question"]  # lock question text
+            forced_file = sc.get("force_file")
+            forced_tool = sc.get("force_tool")
 
         if not question:
             status = "blocked"
             raise HTTPException(status_code=400, detail="Missing question.")
 
-        warnings: list[str] = []
         sources: list[dict] = []
         context = ""
 
@@ -1080,19 +1337,32 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         tool_used = None
         tool_result = None
 
-        routed = route_tool(question)
-        if routed is not None:
-            tool_name, tool_args = routed
+        # DEMO script tool overrides router (100% stable)
+        if DEMO_MODE and DEMO_SCRIPT_ENABLED and forced_tool:
+            tool_name, tool_args = forced_tool
             tool_used = tool_name
 
-            # Execute tool (deterministic, no LLM)
             if tool_name == "incident.list_open":
                 tool_result = list_open_incidents(question, limit=int(tool_args.get("limit", 10)))
             elif tool_name == "runbook.get_checklist":
                 tool_result = get_sev_checklist(sev=int(tool_args.get("sev", 2)))
             else:
                 tool_result = None
-                warnings.append(f"Tool routed but not implemented: {tool_name}")
+                warnings.append(f"Forced tool not implemented: {tool_name}")
+
+        else:
+            routed = route_tool(question)
+            if routed is not None:
+                tool_name, tool_args = routed
+                tool_used = tool_name
+
+                if tool_name == "incident.list_open":
+                    tool_result = list_open_incidents(question, limit=int(tool_args.get("limit", 10)))
+                elif tool_name == "runbook.get_checklist":
+                    tool_result = get_sev_checklist(sev=int(tool_args.get("sev", 2)))
+                else:
+                    tool_result = None
+                    warnings.append(f"Tool routed but not implemented: {tool_name}")
 
         # ----------------------------
         # DEMO MODE: tool-only, no LLM/RAG dependency
@@ -1102,7 +1372,21 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
             async with KB_LOCK:
                 kb_files = len({c["source"] for c in KB_CHUNKS})
                 kb_chunks = len(KB_CHUNKS)
-                hits = keyword_topk(question, KB_CHUNKS, k=k)
+                # 🔧 Patch 3: first fetch more hits, then filter
+                hits = keyword_topk(question, KB_CHUNKS, k=max(8, k))
+
+                # 🔒 Force to a single KB file for demo stability
+                if forced_file:
+                    filtered = []
+                    for idx, sc in hits:
+                        if Path(KB_CHUNKS[idx].get("source", "")).name == forced_file:
+                            filtered.append((idx, sc))
+                    # if we have matches in that file, use them only
+                    if filtered:
+                        hits = filtered[:k]
+                    else:
+                        # hard fail to avoid "wrong doc" demos
+                        hits = []
 
             sources = []
             ctx_lines = []
@@ -1134,18 +1418,88 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
             })
             t_aud1 = _now_ms()
 
+            # Extract bullets from top chunk (product-oriented)
+            def extract_bullets(text: str, max_items: int = 6) -> list[str]:
+                """
+                Turn a chunk into user-facing bullet steps.
+                Prefers existing list items; falls back to short sentences.
+                Filters out generic headings and favors actionable verbs.
+                """
+                if not text:
+                    return []
+
+                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                bullets = []
+                # Skip lines that are just headings or generic descriptors
+                BAD_PREFIX = ("#","##","purpose","this document","severity levels")
+                # Action verbs to prioritize
+                VERBS = ("run","check","notify","assign","declare","restart","validate","document","post","update")
+
+                for ln in lines:
+                    # Skip if line starts with bad prefix
+                    if ln.lower().startswith(BAD_PREFIX):
+                        continue
+                    # markdown list / numbered list
+                    if ln.startswith(("-", "*")):
+                        candidate = ln.lstrip("-* ").strip()
+                        bullets.append(candidate)
+                    elif re.match(r"^\d+[\)\.] ", ln):
+                        candidate = re.sub(r"^\d+[\)\.] ", "", ln).strip()
+                        bullets.append(candidate)
+                    if len(bullets) >= max_items:
+                        return bullets
+
+                # fallback: split sentences roughly, but only keep those with action verbs
+                blob = " ".join(lines)
+                parts = re.split(r"(?<=[\.\?\!])\s+", blob)
+                for p in parts:
+                    p = p.strip()
+                    if p and len(p) >= 12 and any(v in p.lower() for v in VERBS):
+                        bullets.append(p[:180])
+                    if len(bullets) >= max_items:
+                        break
+                return bullets
+
+
+            def best_source_note(src_cards: list[dict]) -> str:
+                if not src_cards:
+                    return "No internal sources were matched."
+                top = src_cards[0]
+                sec = top.get("section") or ""
+                return f"Top evidence: {top.get('source')} {sec}".strip()
+
+
+            # Smart hit selection: prefer specific files for certain queries
+            def pick_best_hit(question: str, hits: list[tuple[int, float]], chunks: list[dict]) -> int | None:
+                q = (question or "").lower()
+                if not hits:
+                    return None
+                # Sev-1 specific: prefer incident_playbook_sev1.md
+                if "sev-1" in q or "sev1" in q:
+                    for i, sc in hits:
+                        if Path(chunks[i].get("source","")).name == "incident_playbook_sev1.md":
+                            return i
+                # Customer update / draft: prefer incident_comms_templates.md
+                if "customer update" in q or "draft" in q:
+                    for i, sc in hits:
+                        if Path(chunks[i].get("source","")).name == "incident_comms_templates.md":
+                            return i
+                # Default to top hit
+                return hits[0][0]
+
             if sources:
-                answer = {
-                    "summary": "Verified answer from internal docs (LLM disabled in public demo).",
-                    "steps": ctx_lines[:8],
-                    "notes": ["Tip: try buttons like SEV-2 checklist / Gateway overview for richer tool outputs."],
-                    "confidence": 0.75,
-                }
+                top_idx = pick_best_hit(question, hits, KB_CHUNKS) if hits else None
+                top_text = KB_CHUNKS[top_idx]["text"] if top_idx is not None else ""
+                steps = extract_bullets(top_text, max_items=6)
+
+                # Use the enterprise-style template answer generator
+                answer = demo_template_answer(question, steps, sources)
+                warnings.append("DEMO_MODE=1: LLM disabled; deterministic KB retrieval used")
                 status_out = "ok"
-                warnings = ["DEMO_MODE=1: LLM disabled; keyword retrieval used"]
             else:
+                # Optimized no-match prompt
                 answer = {
-                    "summary": "No internal doc match found (LLM disabled in public demo).",
+                    "summary": "No internal source match found. Try one of the suggested scenarios below.",
                     "steps": [],
                     "notes": [
                         "Try: 'Show me the SEV-2 checklist'",
@@ -1156,7 +1510,7 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
                     "confidence": 0.4,
                 }
                 status_out = "ok"
-                warnings = ["DEMO_MODE=1: LLM disabled; no KB match"]
+                warnings = []
 
             return {
                 "request_id": request_id,
@@ -1169,7 +1523,7 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
                     "mode": "verified_kb_only",
                     "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
                     "model": None,
-                    "engine": "kb",
+                    "engine": "kb_demo",
                 },
                 "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": max(0, t_aud1 - t_aud0), "total": (_now_ms() - t0)},
                 "warnings": warnings,
@@ -1310,6 +1664,24 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
             async with KB_LOCK:
                 kb_files = len({c["source"] for c in KB_CHUNKS})
                 kb_chunks = len(KB_CHUNKS)
+            
+            if kb_chunks == 0:
+                return {
+                    "request_id": request_id,
+                    "status": "ok",
+                    "answer": {
+                        "summary": "KB is still loading. Please retry in a few seconds.",
+                        "steps": [],
+                        "notes": ["This demo indexes markdown KB on startup."],
+                        "confidence": 0.4,
+                    },
+                    "sources": [],
+                    "tool": {"used": None, "result": None},
+                    "meta": {"k": k, "mode": "demo_kb_only", "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks}, "model": None, "engine": "kb_demo"},
+                    "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": 0, "total": (_now_ms() - t0)},
+                    "warnings": ["KB indexing in progress"],
+                    "debug": {"rag_enabled": True},
+                }
 
             t1 = _now_ms()
             total_ms = max(1, t1 - t0)
