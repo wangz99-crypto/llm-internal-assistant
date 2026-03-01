@@ -289,15 +289,38 @@ def load_settings() -> Settings:
 
 
 DEMO_MODE = os.getenv("DEMO_MODE", "0") == "1"
+DEMO_ADMIN_KEY = os.getenv("DEMO_ADMIN_KEY", "dev-admin-key")
+DEMO_COOKIE_NAME = "demo_key"
 
-def auth_user(x_api_key: Optional[str]) -> ApiKeyUser:
+
+def resolve_api_key(x_api_key: Optional[str], request: Optional[Request]) -> Optional[str]:
+    # Prefer explicit header
+    if x_api_key:
+        return x_api_key
+
+    # Demo cookie (HttpOnly)
+    if request is not None:
+        ck = request.cookies.get(DEMO_COOKIE_NAME)
+        if ck:
+            return ck
+
+    return None
+
+
+def auth_user(x_api_key: Optional[str], request: Optional[Request] = None) -> ApiKeyUser:
     if not SETTINGS.auth_enabled:
         return ApiKeyUser(user_id="anonymous", role="user")
 
-    if not x_api_key or x_api_key not in SETTINGS.api_keys:
+    key = resolve_api_key(x_api_key, request)
+
+    # ✅ Demo mode: if no key provided, treat as admin (for public product demo)
+    if DEMO_MODE and not key:
+        return ApiKeyUser(user_id="demo", role="admin")
+
+    if not key or key not in SETTINGS.api_keys:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
-    return SETTINGS.api_keys[x_api_key]
+    return SETTINGS.api_keys[key]
 
 
 # ----------------------------
@@ -524,7 +547,7 @@ if allowed:
 
 @app.get("/", response_class=HTMLResponse)
 def root():
-    return HTMLResponse("""
+    html = """
 <!doctype html>
 <html lang="en">
 <head>
@@ -626,6 +649,20 @@ def root():
           <div class="spacer"></div>
           <textarea id="q" class="input" placeholder="Try: 'Show me the SEV-2 checklist' or 'How should I handle a Sev-1 incident?'"></textarea>
 
+          <!-- Quick preset dropdown -->
+          <div class="row" style="margin-top:10px">
+            <span class="muted small">Quick questions</span>
+            <select id="preset" class="select" style="flex:1;min-width:260px">
+              <option value="">Select an example…</option>
+              <option value="Show me the SEV-2 checklist">SEV-2 checklist (runbook)</option>
+              <option value="How should I handle a Sev-1 incident?">SEV-1 response (incident)</option>
+              <option value="What does the gateway do? Explain in 5 bullets.">What is the gateway?</option>
+              <option value="Why do we use embeddings? Explain simply.">Embeddings explained</option>
+              <option value="What are the security controls? Give a short summary.">Security controls</option>
+            </select>
+            <button class="btn secondary" onclick="applyPreset()">Insert</button>
+          </div>
+
           <div class="spacer"></div>
           <div class="row">
             <label class="muted">k</label>
@@ -637,7 +674,6 @@ def root():
               <option value="chat">Chat (LLM)</option>
             </select>
 
-            <input id="apiKey" class="input" style="flex:1;min-width:220px" placeholder="x-api-key (optional)" />
             <button id="askBtn" class="btn" onclick="runAsk()">Ask</button>
             <button class="btn ghost" onclick="clearUI()">Clear</button>
           </div>
@@ -749,6 +785,12 @@ def root():
     runAsk();
   }
 
+  function applyPreset(){
+    const v = document.getElementById("preset").value;
+    if (!v) return;
+    document.getElementById("q").value = v;
+  }
+
   function esc(s){
     return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
   }
@@ -855,7 +897,6 @@ def root():
     const q = document.getElementById("q").value.trim();
     const k = Number(document.getElementById("k").value || 3);
     const mode = document.getElementById("mode").value;
-    const apiKey = document.getElementById("apiKey").value.trim();
 
     clearUI();
     if (!q){
@@ -870,7 +911,7 @@ def root():
 
     try{
       const headers = {"Content-Type":"application/json"};
-      if (apiKey) headers["x-api-key"] = apiKey;
+      // No API key header - handled by cookie or demo mode
 
       const res = await fetch("/ask", {
         method:"POST",
@@ -907,12 +948,25 @@ def root():
 </script>
 </body>
 </html>
-    """)
+    """
+    resp = HTMLResponse(html)
+    
+    # ✅ Set demo cookie (HttpOnly) so browser carries it automatically
+    if DEMO_MODE:
+        resp.set_cookie(
+            key=DEMO_COOKIE_NAME,
+            value=DEMO_ADMIN_KEY,
+            httponly=True,
+            samesite="lax",
+            secure=True,  # Render is https
+            max_age=60 * 60 * 24 * 7,
+        )
+    return resp
 
 
 @app.post("/reload_kb")
-async def reload_kb(x_api_key: Optional[str] = Header(default=None)):
-    user = auth_user(x_api_key)
+async def reload_kb(x_api_key: Optional[str] = Header(default=None), request: Request = None):
+    user = auth_user(x_api_key, request=request)
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin only.")
 
@@ -929,12 +983,12 @@ async def reload_kb(x_api_key: Optional[str] = Header(default=None)):
         }
 
 @app.get("/kb_status")
-async def kb_status(x_api_key: Optional[str] = Header(default=None)):
+async def kb_status(x_api_key: Optional[str] = Header(default=None), request: Request = None):
     """
     Return current KB indexing status for debugging / demo.
     If you prefer it to be internal-only, keep it admin-only.
     """
-    user = auth_user(x_api_key)
+    user = auth_user(x_api_key, request=request)
 
     
     if user.role != "admin":
@@ -993,7 +1047,7 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
     request_id = str(uuid.uuid4())
     t0 = _now_ms()
 
-    user = auth_user(x_api_key)
+    user = auth_user(x_api_key, request=request)
 
     status = "ok"
     model_name = SETTINGS.model  
@@ -1006,6 +1060,11 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         mode = str(payload.get("mode", "hybrid")).strip().lower()
         if mode not in ("kb", "hybrid", "chat"):
             raise HTTPException(status_code=400, detail="Invalid mode. Use: kb | hybrid | chat.")
+
+        # ✅ Demo mode: fallback from chat to hybrid
+        if DEMO_MODE and mode == "chat":
+            warnings.append("Public demo: LLM disabled. Falling back to Hybrid.")
+            mode = "hybrid"
 
         if not question:
             status = "blocked"
@@ -1055,6 +1114,26 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
                 section = card.get("section") or ""
                 ctx_lines.append(f"[{rank}] {card['source']} {section}")
 
+            # Audit log for demo mode
+            t_aud0 = _now_ms()
+            q_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+            write_audit({
+                "request_id": request_id,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "user_id": user.user_id,
+                "role": user.role,
+                "engine": "kb_demo",
+                "model": None,
+                "prompt_hash": q_hash,
+                "status": "ok",
+                "latency_ms": (_now_ms() - t0),
+                "rag": True,
+                "rag_k": k,
+                "rag_sources": [s["source"] for s in sources],
+                "tool_used": None,
+            })
+            t_aud1 = _now_ms()
+
             if sources:
                 answer = {
                     "summary": "Verified answer from internal docs (LLM disabled in public demo).",
@@ -1092,9 +1171,9 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
                     "model": None,
                     "engine": "kb",
                 },
-                "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": 0, "total": (_now_ms() - t0)},
+                "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": max(0, t_aud1 - t_aud0), "total": (_now_ms() - t0)},
                 "warnings": warnings,
-                "debug": {"prompt_hash": hashlib.sha256(question.encode("utf-8")).hexdigest()[:16], "rag_enabled": True},
+                "debug": {"prompt_hash": q_hash, "rag_enabled": True},
             }
 
         # ----------------------------
@@ -1495,7 +1574,7 @@ async def chat_completions(request: Request, x_api_key: Optional[str] = Header(d
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     start = time.time()
 
-    user = auth_user(x_api_key)
+    user = auth_user(x_api_key, request=request)
     _check_rate_limit(user, SETTINGS.policy)
 
     payload = await request.json()
@@ -1583,7 +1662,7 @@ async def chat_completions_stream(request: Request, x_api_key: Optional[str] = H
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     start = time.time()
 
-    user = auth_user(x_api_key)
+    user = auth_user(x_api_key, request=request)
     _check_rate_limit(user, SETTINGS.policy)
 
     payload = await request.json()
