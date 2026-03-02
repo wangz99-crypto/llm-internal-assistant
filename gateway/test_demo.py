@@ -20,11 +20,16 @@ for sid in scenarios:
     r = requests.post(
         f"{BASE}/ask",
         json={
+            "question": "run demo",
             "scenario_id": sid,
             "k": 2,
-            "mode": "hybrid"
-        }
+            "mode": "hybrid",
+        },
     )
 
-    data = r.json()
-    print(json.dumps(data, indent=2))
+    print(r.status_code)
+    try:
+        data = r.json()
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+    except Exception:
+        print(r.text[:500])

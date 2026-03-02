@@ -19,10 +19,73 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-# --- tools (business layer) ---
-from src.tools.router import route_tool
-from src.tools.incident_tool import list_open_incidents
-from src.tools.runbook_tool import get_sev_checklist
+from gateway.src.tools.router import route_tool
+from gateway.src.tools.incident_tool import list_open_incidents
+from gateway.src.tools.runbook_tool import get_sev_checklist
+from gateway.src.ui.demo_page import mount_demo_ui
+
+# ==========================================
+# Demo deterministic scenarios
+# ==========================================
+
+DEMO_SCENARIOS = {
+    "sev2": {
+        "summary": "SEV2 checklist retrieved from runbook.",
+        "steps": [
+            "Confirm impact: elevated latency / partial failures (SEV2).",
+            "Run: docker compose ps",
+            "Check gateway logs",
+            "Restart unhealthy service if needed",
+            "Validate /health endpoint",
+            "Document incident timeline"
+        ],
+        "notes": [
+            "Demo mode: deterministic checklist for presentation."
+        ],
+        "sources": ["runbook.md", "incident_response.md"]
+    },
+
+    "escalation": {
+        "summary": "Escalation policy overview.",
+        "steps": [
+            "SEV1 → Immediate page to on-call engineer",
+            "SEV2 → Notify service owner within 15 minutes",
+            "SEV3 → Create ticket and monitor next business day"
+        ],
+        "notes": [
+            "Escalation policy ensures prioritized incident handling."
+        ],
+        "sources": ["incident_response.md"]
+    },
+
+    "audit": {
+        "summary": "Audit logging design overview.",
+        "steps": [
+            "Each request is assigned a unique request_id",
+            "Prompt hash is recorded",
+            "Tool usage is logged",
+            "Timing metrics are stored"
+        ],
+        "notes": [
+            "Audit logs enable traceability and compliance."
+        ],
+        "sources": ["audit.md"]
+    },
+
+    "architecture": {
+        "summary": "System architecture overview.",
+        "steps": [
+            "Client sends request to Gateway (FastAPI)",
+            "Router decides tool vs RAG vs LLM",
+            "RAG retrieves verified KB chunks",
+            "LLM generates structured response"
+        ],
+        "notes": [
+            "Enterprise-focused LLM gateway architecture."
+        ],
+        "sources": ["architecture.md"]
+    }
+}
 
 # ----------------------------
 # Config
@@ -70,6 +133,7 @@ logger = logging.getLogger("gateway")
 # ----------------------------
 KB_LOCK = asyncio.Lock()
 
+BASE_DIR = Path(__file__).resolve().parent.parent
 KB_DIR = BASE_DIR / "kb"
 KB_CHUNKS: list[dict] = []
 KB_EMB: np.ndarray | None = None
@@ -78,11 +142,48 @@ KB_EMB: np.ndarray | None = None
 # Move _ws definition BEFORE any function that uses it (clean_preview)
 _ws = re.compile(r"\s+")
 
+# ==========================================
+# Sanitization utilities
+# ==========================================
+_ONLY_NUMBER_RE = re.compile(r"^\d+[\.\)]?$")  # "5" / "5." / "5)"
+_ONLY_PUNCT_RE  = re.compile(r"^[-*—–]+$")     # "-" "*" "—"
 
-def chunk_text(text: str, max_chars: int = 320, overlap: int = 80) -> list[tuple[str, int]]:
+def sanitize_lines(items: Any, limit: int = 8) -> list[str]:
+    """
+    Remove empty lines, pure numbering lines like '5.' and meaningless punctuation bullets.
+    Collapse whitespace to keep UI stable.
+    Also filter out obviously cut-off fragments.
+    """
+    if not isinstance(items, list):
+        return []
+
+    out: list[str] = []
+    for x in items:
+        s = str(x or "")
+        s = _ws.sub(" ", s).strip()
+        if not s:
+            continue
+        if _ONLY_NUMBER_RE.match(s):
+            continue
+        if _ONLY_PUNCT_RE.match(s):
+            continue
+            
+        # PATCH 1: drop obviously cut-off fragments like "Post in" / "Executive visibi"
+        if len(s) < 18 and (" " in s) and not any(s.endswith(p) for p in (".", "!", "?", ":", ";")):
+            last = s.rsplit(" ", 1)[-1]
+            if len(last) <= 6:   # visibi / in / for
+                continue
+                
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def chunk_text(text: str, max_chars: int = 480, overlap: int = 120) -> list[tuple[str, int]]:
     """
     Return list of (chunk_text, start_offset).
-    Smaller chunks -> more realistic enterprise KB retrieval.
+    Larger chunks -> fewer truncated sentences, more realistic enterprise KB retrieval.
     """
     text = text.strip()
     if not text:
@@ -111,6 +212,7 @@ def display_source(path_str: str) -> str:
         return str(p.relative_to(BASE_DIR))
     except Exception:
         return path_str
+
 def pretty_title(doc_type: str, source: str) -> str:
     base = Path(source).stem.replace("_", " ").replace("-", " ").title()
     if doc_type and doc_type != "Document":
@@ -273,7 +375,7 @@ def keyword_topk(question: str, chunks: list[dict], k: int = 3) -> list[tuple[in
 def load_settings() -> Settings:
     """
     Load Settings from YAML config.
-    - Uses CONFIG_PATH env if set, else defaults to configs/server.yaml
+    - Uses CONFIG_PATH env if set, otherwise defaults to configs/server.yaml
     - CI-friendly fallback to gateway/configs/server.example.yaml when missing
     - Allows ENV override for VLLM_BASE_URL
     """
@@ -351,7 +453,7 @@ DEMO_COOKIE_NAME = "demo_key"
 # ----------------------------
 DEMO_SCRIPT_ENABLED = os.getenv("DEMO_SCRIPT", "1") == "1"  # default ON in demo
 
-DEMO_SCENARIOS = {
+DEMO_SCENARIOS_OLD = {
     # TOOL-FIRST (always stable)
     "sev2_checklist": {
         "label": "Runbook: SEV-2 checklist (tool)",
@@ -539,6 +641,93 @@ async def embed_texts(texts: list[str]) -> np.ndarray:
     return np.array(vecs, dtype=np.float32)
 
 
+def extract_bullets(text: str, max_items: int = 6) -> list[str]:
+    """
+    Turn a chunk into user-facing bullet steps.
+    Prefers existing list items; falls back to short sentences.
+    Filters out generic headings and favors actionable verbs.
+    """
+    if not text:
+        return []
+
+    def safe_trim(s: str, max_len: int = 140) -> str:
+        s = (s or "").strip()
+        # Filter out pure symbols/meaningless short strings
+        if not s or s in {"-", "*", "—", "–"}:
+            return ""
+        # Filter out pure number lines like "5."
+        if re.fullmatch(r"\d+[\.\)]?", s):
+            return ""
+        if len(s) <= max_len:
+            return s
+        cut = s[:max_len]
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        cut = cut.rstrip(" ,;:-")
+        
+        # PATCH 2: if looks truncated, drop it
+        if cut and len(cut) < max_len and not any(cut.endswith(p) for p in (".", "!", "?", ":", ";")):
+            last = cut.rsplit(" ", 1)[-1] if " " in cut else cut
+            if len(last) <= 6 and len(cut) < 22:
+                return ""
+                
+        return (cut + "…") if cut else ""
+
+    # Note: keep non-empty lines
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    bullets: list[str] = []
+
+    BAD_PREFIX = ("#", "##", "purpose", "this document", "severity levels")
+    VERBS = ("run", "check", "notify", "assign", "declare", "restart", "validate", "document", "post", "update")
+
+    # 1) Prioritize markdown lists/numbered lists
+    for ln in lines:
+        low = ln.lower()
+        if low.startswith(BAD_PREFIX):
+            continue
+
+        candidate = ""
+        if ln.startswith(("-", "*")):
+            candidate = ln.lstrip("-* ").strip()
+        elif re.match(r"^\d+[\)\.] ", ln):
+            candidate = re.sub(r"^\d+[\)\.] ", "", ln).strip()
+
+        candidate = safe_trim(candidate)
+        if candidate:
+            bullets.append(candidate)
+
+        if len(bullets) >= max_items:
+            break
+
+    # 2) fallback: if no bullets found, pick sentences that look like action steps
+    if not bullets:
+        blob = " ".join(lines)
+        parts = re.split(r"(?<=[\.\?\!])\s+", blob)
+        for p in parts:
+            p = safe_trim(p, max_len=160)
+            if not p:
+                continue
+            # Only keep sentences containing action verbs
+            if any(v in p.lower() for v in VERBS) and len(p) >= 12:
+                bullets.append(p)
+            if len(bullets) >= max_items:
+                break
+
+    # 3) Final deduplication + empty removal + truncate count
+    out: list[str] = []
+    seen = set()
+    for b in bullets:
+        b = (b or "").strip()
+        if not b:
+            continue
+        if b in seen:
+            continue
+        seen.add(b)
+        out.append(b)
+        if len(out) >= max_items:
+            break
+
+    return out
 
 
 async def build_kb_index() -> None:
@@ -561,7 +750,7 @@ async def build_kb_index() -> None:
             if not text:
                 continue
 
-            for c_text, c_start in chunk_text(text, max_chars=320, overlap=80):
+            for c_text, c_start in chunk_text(text, max_chars=480, overlap=120):
                 section = extract_section_for_chunk(text, c_start)
                 chunks.append({
                     "source": str(p),
@@ -639,6 +828,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Internal LLM Gateway with RAG", version="0.2.0", lifespan=lifespan)
 
+# Mount demo UI (root route)
+mount_demo_ui(
+    app,
+    demo_mode=DEMO_MODE,
+    demo_cookie_name=DEMO_COOKIE_NAME,
+    demo_admin_key=DEMO_ADMIN_KEY,
+)
+
 
 # ----------------------------
 # Global exception handler (ensures JSON responses)
@@ -668,7 +865,7 @@ if allowed:
     )
 
 
-# 🔧 Patch 1 & 2: /demo endpoint now reads from DEMO_SCENARIOS
+# /demo endpoint now reads from DEMO_SCENARIOS
 @app.get("/demo")
 def demo_scenarios():
     return {
@@ -676,7 +873,7 @@ def demo_scenarios():
         "script_enabled": DEMO_SCRIPT_ENABLED,
         "scenarios": [
             {"id": sid, "label": cfg["label"], "question": cfg["canonical_question"]}
-            for sid, cfg in DEMO_SCENARIOS.items()
+            for sid, cfg in DEMO_SCENARIOS_OLD.items()
         ],
     }
 
@@ -702,11 +899,15 @@ def demo_template_answer(question: str, steps: list[str], sources: list[dict]) -
         title = "Source-backed deterministic answer."
         notes = ["This hosted demo runs with LLM disabled to emphasize reliability and governance."]
 
-    # stable “top evidence” line
+    # stable "top evidence" line
     if sources:
         top = sources[0]
         sec = top.get("section") or ""
         notes.insert(0, f"Top evidence: {top.get('source')} {sec}".strip())
+
+    # Sanitize steps and notes before returning
+    steps = sanitize_lines(steps, limit=8)
+    notes = sanitize_lines(notes, limit=6)
 
     return {
         "summary": title,
@@ -714,496 +915,6 @@ def demo_template_answer(question: str, steps: list[str], sources: list[dict]) -
         "notes": notes[:4],
         "confidence": 0.75 if steps else 0.55,
     }
-
-
-@app.get("/", response_class=HTMLResponse)
-async def root(request: Request):
-    html = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Internal Assistant — Governance-First AI System</title>
-  <style>
-    :root{
-      --bg:#0b1220; --panel:#0f172a; --muted:#94a3b8; --text:#e5e7eb;
-      --card:#111c33; --border:rgba(148,163,184,0.18);
-      --btn:#2563eb; --btn2:#334155; --ok:#22c55e; --warn:#f59e0b;
-      --code:#0b1020;
-    }
-    *{box-sizing:border-box;font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}
-    body{margin:0;background:linear-gradient(180deg,#070b14 0%,#0b1220 100%);color:var(--text);}
-    a{color:#93c5fd;text-decoration:none}
-    .wrap{max-width:1100px;margin:0 auto;padding:28px 18px 42px;}
-    .hero{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px;}
-    .title{font-size:22px;font-weight:800;letter-spacing:0.2px;}
-    .sub{color:var(--muted);margin-top:6px;line-height:1.4}
-    .badges{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
-    .badge{display:inline-flex;gap:8px;align-items:center;padding:6px 10px;border:1px solid var(--border);
-      background:rgba(17,28,51,0.6);border-radius:999px;color:#cbd5e1;font-size:13px}
-    .dot{width:8px;height:8px;border-radius:50%}
-    .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)}
-    .grid{display:grid;grid-template-columns: 1.15fr 0.85fr;gap:16px;align-items:start;}
-    @media (max-width: 980px){.grid{grid-template-columns:1fr}}
-    .panel{background:rgba(15,23,42,0.82);border:1px solid var(--border);border-radius:16px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.35);overflow:hidden}
-    .panel-h{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
-    .panel-h .h{font-weight:800}
-    .panel-b{padding:16px}
-    .muted{color:var(--muted)}
-    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-    .input, .select, .num{
-      background:rgba(2,6,23,0.6);border:1px solid var(--border);color:var(--text);
-      border-radius:12px;padding:10px 12px;font-size:14px;outline:none;
-    }
-    textarea.input{width:100%;min-height:120px;resize:vertical;line-height:1.45}
-    .select{padding:10px 12px}
-    .num{width:92px}
-    .btn{background:var(--btn);border:none;color:white;padding:10px 14px;border-radius:12px;
-      font-weight:700;cursor:pointer}
-    .btn.secondary{background:var(--btn2)}
-    .btn.ghost{background:transparent;border:1px solid var(--border);color:#cbd5e1}
-    .btn:disabled{opacity:.6;cursor:not-allowed}
-    .try{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}
-    .try .btn{font-size:13px;padding:8px 10px}
-    .pill{font-size:12px;color:#cbd5e1;background:rgba(2,6,23,0.55);border:1px solid var(--border);
-      border-radius:999px;padding:6px 10px}
-    .card{background:rgba(17,28,51,0.65);border:1px solid var(--border);border-radius:14px;padding:12px 12px;margin-top:12px}
-    .card h4{margin:0 0 8px 0;font-size:14px}
-    .kvs{display:grid;grid-template-columns: 150px 1fr;gap:6px 10px;font-size:13px}
-    .kvs div:nth-child(odd){color:var(--muted)}
-    .list{margin:8px 0 0 18px;color:#e2e8f0}
-    .list li{margin:5px 0}
-    .callout{margin-top:12px;padding:10px 12px;border-radius:12px;border:1px solid var(--border);
-      background:rgba(2,6,23,0.45);color:#cbd5e1;font-size:13px;line-height:1.45}
-    details{margin-top:12px}
-    summary{cursor:pointer;color:#cbd5e1;font-weight:700}
-    pre{background:var(--code);border:1px solid var(--border);padding:12px;border-radius:12px;overflow:auto;color:#d1d5db}
-    .small{font-size:12px}
-    .okline{color:#86efac}
-    .warnline{color:#fbbf24}
-    .errline{color:#fca5a5}
-    .spacer{height:8px}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="hero">
-      <div>
-        <!-- Landing area with more product-oriented language -->
-        <div class="title">🧩 Internal Assistant — Governance-First AI System</div>
-        <div class="sub">
-          A system-oriented assistant that delivers <b>source-backed answers</b>,
-          <b>action-ready runbooks</b>, and <b>auditable request traces</b>.
-          Designed for reliability, compliance, and operational clarity.
-        </div>
-        <div class="badges">
-          <div class="badge"><span class="dot ok"></span><b>Source-backed</b> <span class="muted">verify before acting</span></div>
-          <div class="badge"><span class="dot ok"></span><b>Action steps</b> <span class="muted">runbooks & checklists</span></div>
-          <div class="badge"><span class="dot ok"></span><b>Audit-ready</b> <span class="muted">request id + timings</span></div>
-          <div class="badge"><span class="dot warn"></span><b>Hybrid</b> <span class="muted">best default mode</span></div>
-        </div>
-      </div>
-      <div class="pill">
-        Endpoint: <a href="/docs" target="_blank">/docs</a> · Health: <a href="/health" target="_blank">/health</a>
-      </div>
-    </div>
-
-    <div class="grid">
-      <!-- Left: Playground (renamed to Demo Runner) -->
-      <div class="panel">
-        <div class="panel-h">
-          <div class="h">🎬 Demo Runner</div>
-          <div class="muted small" id="statusLine">Ready</div>
-        </div>
-        <div class="panel-b">
-          <div class="muted small">Pick a scenario below. This hosted demo runs in deterministic mode (LLM disabled) to showcase reliability, evidence, and auditability.</div>
-          <div class="spacer"></div>
-          <textarea id="q" class="input" placeholder="Scenario question will appear here" readonly></textarea>
-
-          <!-- Quick preset dropdown (now using scenario_id) -->
-          <div class="row" style="margin-top:10px">
-            <span class="muted small">Select scenario</span>
-            <select id="preset" class="select" style="flex:1;min-width:260px">
-              <option value="">— Choose a scenario —</option>
-              <option value="sev2_checklist">SEV-2 checklist (runbook)</option>
-              <option value="sev1_response">SEV-1 response (incident)</option>
-              <option value="escalation_policy">Escalation policy</option>
-              <option value="customer_outage_first">Customer outage scenario</option>
-              <option value="customer_update_template">Customer update draft</option>
-              <option value="audit_logging">Audit logging overview</option>
-              <option value="modes_guidance">Usage guidance</option>
-              <option value="architecture_overview">Architecture overview</option>
-              <option value="security_controls">Security controls</option>
-              <option value="product_overview">Product overview</option>
-            </select>
-            <button class="btn secondary" onclick="applyPreset()">Load</button>
-          </div>
-
-          <div class="spacer"></div>
-          <div class="row">
-            <label class="muted">k</label>
-            <input id="k" class="num" type="number" min="0" max="8" value="3" />
-            <label class="muted">mode</label>
-            <select id="mode" class="select">
-              <option value="hybrid" selected>Hybrid (recommended)</option>
-              <option value="kb">Verified (KB only)</option>
-              <option value="chat">Assist: In private deployment, LLM-backed rewriting is enabled; hosted demo focuses on governance-first behavior.</option>
-            </select>
-
-            <button id="askBtn" class="btn" onclick="runAsk()">Run scenario</button>
-            <button class="btn ghost" onclick="clearUI()">Clear</button>
-          </div>
-
-          <div class="try">
-            <button class="btn secondary" onclick="quickAskScenario('escalation_policy')">Escalation policy</button>
-            <button class="btn secondary" onclick="quickAskScenario('customer_outage_first')">Customer outage</button>
-            <button class="btn secondary" onclick="quickAskScenario('sev2_checklist')">SEV-2 checklist</button>
-            <button class="btn secondary" onclick="quickAskScenario('sev1_response')">Handle SEV-1</button>
-            <button class="btn secondary" onclick="quickAskScenario('customer_update_template')">Customer update</button>
-            <button class="btn secondary" onclick="quickAskScenario('audit_logging')">Audit logging</button>
-            <button class="btn secondary" onclick="quickAskScenario('modes_guidance')">Usage guidance</button>
-          </div>
-
-          <div id="friendlyHint" class="callout" style="display:none"></div>
-
-          <!-- Answer -->
-          <div id="answerCard" class="card" style="display:none">
-            <h4>🧠 Answer</h4>
-            <div id="answerBody" class="small"></div>
-          </div>
-
-          <!-- Sources -->
-          <div id="sourcesCard" class="card" style="display:none">
-            <h4>📚 Sources</h4>
-            <div id="sourcesBody" class="small"></div>
-          </div>
-
-          <!-- Request details -->
-          <details id="techBox" style="display:none">
-            <summary>🧾 Request details (click to expand)</summary>
-            <div class="spacer"></div>
-            <div id="techMeta" class="small"></div>
-            <div class="spacer"></div>
-            <button class="btn ghost" onclick="copyRaw()">Copy raw JSON</button>
-            <div class="spacer"></div>
-            <pre id="rawJson" class="small"></pre>
-          </details>
-
-          <!-- Error -->
-          <div id="errorBox" class="card" style="display:none">
-            <h4>❗ Error</h4>
-            <pre id="errorText" class="small errline"></pre>
-          </div>
-        </div>
-      </div>
-
-      <!-- Right: How to use -->
-      <div class="panel">
-        <div class="panel-h">
-          <div class="h">🧭 How to use</div>
-          <div class="pill">Quick guidance</div>
-        </div>
-        <div class="panel-b">
-          <div class="callout">
-            <b>Usage tips</b>
-            <ol class="list">
-              <li>Start with <b>SEV-2 checklist</b> to see an actionable, step-by-step response with sources.</li>
-              <li>Ask a general question in <b>Hybrid</b> mode to get the best balance of internal knowledge + explanation.</li>
-              <li>Open <b>Request details</b> to view an audit-friendly record (request id + timings).</li>
-            </ol>
-          </div>
-
-          <div class="card">
-            <h4>Modes (plain English)</h4>
-            <div class="kvs">
-              <div>Hybrid</div>
-              <div><b>Best for most questions.</b> Uses internal knowledge first; adds a clear explanation when needed.</div>
-
-              <div>Verified</div>
-              <div><b>Best for compliance.</b> Answers only when internal sources support the response.</div>
-
-              <div>Assist</div>
-              <div><b>Best for drafting.</b> More free-form help. (In this hosted demo, advanced LLM is limited; a GPU-backed version is available in private deployment.)</div>
-            </div>
-          </div>
-
-          <div class="card">
-            <h4>Business value</h4>
-            <!-- Enhanced Business value block -->
-            <ul class="list">
-              <li><b>Operational clarity</b> — structured steps reduce ambiguity during incidents.</li>
-              <li><b>Risk reduction</b> — answers are grounded in internal policies before action.</li>
-              <li><b>Governance-first design</b> — every request is traceable and reviewable.</li>
-            </ul>
-          </div>
-
-          <div class="card small muted">
-            This demo focuses on reliability and traceability. In a private environment, the same design supports a GPU-backed LLM for richer reasoning while keeping the same safety controls.
-          </div>
-          <!-- Project highlights card (interview-friendly) -->
-          <div class="card">
-            <h4>Project highlights</h4>
-            <ul class="list">
-              <li>Retrieval + verification architecture</li>
-              <li>Mode-based response strategy (Verified / Hybrid / Assist)</li>
-              <li>Structured runbook outputs</li>
-              <li>Audit-friendly logging (JSONL)</li>
-              <li>Tool routing for deterministic workflows</li>
-            </ul>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-<script>
-  let DEMO_MAP = {};      // scenario_id -> {label, question}
-  let SELECTED_SCENARIO = "";
-
-  async function loadDemoScenarios(){
-    try{
-      const r = await fetch("/demo");
-      const j = await r.json();
-      (j.scenarios || []).forEach(s => { DEMO_MAP[s.id] = s; });
-    }catch(e){
-      // ignore
-    }
-  }
-
-  // call on page load
-  loadDemoScenarios();
-
-  let LAST_RAW = "";
-
-  function setStatus(msg){ document.getElementById("statusLine").textContent = msg; }
-
-  function clearUI(){
-    document.getElementById("friendlyHint").style.display = "none";
-    document.getElementById("answerCard").style.display = "none";
-    document.getElementById("sourcesCard").style.display = "none";
-    document.getElementById("techBox").style.display = "none";
-    document.getElementById("errorBox").style.display = "none";
-    document.getElementById("answerBody").innerHTML = "";
-    document.getElementById("sourcesBody").innerHTML = "";
-    document.getElementById("techMeta").innerHTML = "";
-    document.getElementById("rawJson").textContent = "";
-    document.getElementById("errorText").textContent = "";
-    LAST_RAW = "";
-    setStatus("Ready");
-  }
-
-  function quickAskScenario(sid){
-    SELECTED_SCENARIO = sid;
-    const item = DEMO_MAP[sid];
-    document.getElementById("q").value = (item && item.question) ? item.question : `Scenario: ${sid}`;
-    runAsk();
-  }
-
-  function applyPreset(){
-    const sid = document.getElementById("preset").value;
-    if (!sid) return;
-
-    SELECTED_SCENARIO = sid;
-
-    const item = DEMO_MAP[sid];
-    if (item && item.question){
-      document.getElementById("q").value = item.question;
-    } else {
-      // fallback: show id if demo endpoint not loaded
-      document.getElementById("q").value = `Scenario: ${sid}`;
-    }
-  }
-
-  function esc(s){
-    return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
-  }
-
-  function confLabel(x){
-    if (typeof x !== "number") return null;
-    if (x >= 0.8) return "High";
-    if (x >= 0.55) return "Medium";
-    return "Low";
-  }
-
-  function renderAnswer(data){
-    const ans = data.answer;
-    const meta = data.meta || {};
-    const engine = (meta.engine || "").toLowerCase();
-    const model = meta.model || null;
-
-    // Friendly hint line (product language)
-    let hint = "";
-    // Enhanced product capability hint
-    if (engine === "tool" || engine === "kb") {
-      hint = "✅ Source-backed result — grounded in internal policies and runbooks.";
-    } else {
-      hint = "✨ Best-effort explanation: combines internal context (when available) with a clear summary.";
-    }
-
-    const hintBox = document.getElementById("friendlyHint");
-    hintBox.innerHTML = esc(hint);
-    hintBox.style.display = "block";
-
-    // Build Answer UI (handles your tool-style object + string)
-    let html = "";
-    if (typeof ans === "string") {
-      html += `<div>${esc(ans)}</div>`;
-    } else if (ans && typeof ans === "object") {
-      if (ans.summary) html += `<div><b>${esc(ans.summary)}</b></div>`;
-      if (Array.isArray(ans.steps) && ans.steps.length){
-        html += `<div class="spacer"></div><div class="muted">Steps</div><ol class="list">` +
-          ans.steps.map(x=>`<li>${esc(x)}</li>`).join("") + `</ol>`;
-      }
-      if (Array.isArray(ans.notes) && ans.notes.length){
-        html += `<div class="spacer"></div><div class="muted">Notes</div><ul class="list">` +
-          ans.notes.map(x=>`<li>${esc(x)}</li>`).join("") + `</ul>`;
-      }
-      const cl = confLabel(ans.confidence);
-      if (cl){
-        html += `<div class="spacer"></div><div class="muted">Confidence</div><div>${esc(cl)}</div>`;
-      }
-    } else {
-      html += `<div class="muted">No answer payload.</div>`;
-    }
-
-    document.getElementById("answerBody").innerHTML = html;
-    document.getElementById("answerCard").style.display = "block";
-  }
-
-  function renderSources(data){
-    const sources = data.sources || [];
-    if (!sources.length){
-      document.getElementById("sourcesCard").style.display = "none";
-      return;
-    }
-    const html = sources.slice(0,3).map(s=>{
-      const title = s.title ? ` — <span class="muted">${esc(s.title)}</span>` : "";
-      const preview = s.preview ? esc(s.preview) : "";
-      return `<div class="card" style="margin-top:10px">
-        <div><b>${esc(s.source || "source")}</b>${title}</div>
-        <div class="muted small" style="margin-top:6px;white-space:pre-wrap">${preview}</div>
-      </div>`;
-    }).join("");
-    document.getElementById("sourcesBody").innerHTML = html;
-    document.getElementById("sourcesCard").style.display = "block";
-  }
-
-  function renderTech(data){
-    const meta = data.meta || {};
-    const t = data.timings_ms || {};
-    const tool = data.tool || {};
-    const engine = meta.engine || "";
-    const model = meta.model || "—";
-    const rid = data.request_id || "—";
-
-    const metaHtml = `
-      <div class="kvs">
-        <div>request_id</div><div>${esc(rid)}</div>
-        <div>engine</div><div>${esc(engine)}</div>
-        <div>model</div><div>${esc(String(model))}</div>
-        <div>timings</div><div>${esc(JSON.stringify(t))}</div>
-        <div>tool</div><div>${esc(tool.used || "—")}</div>
-      </div>
-    `;
-    document.getElementById("techMeta").innerHTML = metaHtml;
-
-    LAST_RAW = JSON.stringify(data, null, 2);
-    document.getElementById("rawJson").textContent = LAST_RAW;
-    document.getElementById("techBox").style.display = "block";
-  }
-
-  async function copyRaw(){
-    if (!LAST_RAW) return;
-    try{
-      await navigator.clipboard.writeText(LAST_RAW);
-      setStatus("Copied raw JSON ✅");
-      setTimeout(()=>setStatus("Ready"), 1200);
-    }catch(e){
-      setStatus("Copy failed");
-    }
-  }
-
-  async function runAsk(){
-    const q = document.getElementById("q").value.trim();
-    const k = Number(document.getElementById("k").value || 3);
-    const mode = document.getElementById("mode").value;
-
-    const scenarioId = SELECTED_SCENARIO || document.getElementById("preset").value || "";
-
-    if (!scenarioId){
-      document.getElementById("errorBox").style.display = "block";
-      document.getElementById("errorText").textContent = "Please select a demo scenario.";
-      return;
-    }
-
-    clearUI();
-
-    const askBtn = document.getElementById("askBtn");
-    askBtn.disabled = true;
-    setStatus("Running scenario…");
-
-    try{
-      const headers = {"Content-Type":"application/json"};
-      // No API key header - handled by cookie or demo mode
-
-      const res = await fetch("/ask", {
-        method:"POST",
-        headers,
-        body: JSON.stringify({ scenario_id: scenarioId, k:k, mode:mode })
-      });
-
-      // Always read text first, then try JSON.
-      const text = await res.text();
-      let data = null;
-      try{ data = JSON.parse(text); }catch(_){}
-
-      if (!res.ok){
-        const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : text;
-        throw new Error(msg || `Request failed (${res.status})`);
-      }
-      if (!data) throw new Error("Server returned non-JSON response.");
-
-      renderAnswer(data);
-      renderSources(data);
-      renderTech(data);
-
-      // status summary
-      const eng = (data.meta && data.meta.engine) ? data.meta.engine : "ok";
-      setStatus(`Done · engine=${eng}`);
-    }catch(err){
-      document.getElementById("errorBox").style.display = "block";
-      document.getElementById("errorText").textContent = String(err && err.message ? err.message : err);
-      setStatus("Error");
-    }finally{
-      askBtn.disabled = false;
-    }
-  }
-</script>
-</body>
-</html>
-    """
-    resp = HTMLResponse(html)
-    
-    # Set demo cookie (HttpOnly) so browser carries it automatically
-    if DEMO_MODE:
-        # Determine if request is HTTPS to set secure flag appropriately
-        is_https = True
-        try:
-            is_https = (request.url.scheme == "https")
-        except Exception:
-            pass
-
-        resp.set_cookie(
-            key=DEMO_COOKIE_NAME,
-            value=DEMO_ADMIN_KEY,
-            httponly=True,
-            samesite="lax",
-            secure=is_https,  # Only secure if actual connection is HTTPS
-            max_age=60 * 60 * 24 * 7,
-        )
-    return resp
 
 
 @app.post("/reload_kb")
@@ -1278,6 +989,11 @@ def safe_parse_ui_json(raw_text: str) -> dict:
     obj.setdefault("summary", "I'm not sure.")
     obj.setdefault("steps", [])
     obj.setdefault("notes", [])
+    
+    # Sanitize steps and notes before returning
+    obj["steps"] = sanitize_lines(obj.get("steps", []), limit=8)
+    obj["notes"] = sanitize_lines(obj.get("notes", []), limit=6)
+    
     # optional confidence
     if "confidence" not in obj:
         obj["confidence"] = 0.5
@@ -1286,75 +1002,109 @@ def safe_parse_ui_json(raw_text: str) -> dict:
 
 @app.post("/ask")
 async def ask(request: Request, x_api_key: Optional[str] = Header(default=None)):
+    # =========================
+    # ALWAYS-DEFINED LOCALS
+    # =========================
+    sources: List[Dict[str, Any]] = []      # <-- always exists, avoids UnboundLocalError
+    citations: List[str] = []               # optional: if you have citations_hint
+    tool_route = None
+    tool_name = None
+    tool_args: Dict[str, Any] = {}
+    answer_text = ""
+    debug: Dict[str, Any] = {}
     request_id = str(uuid.uuid4())
     t0 = _now_ms()
+    
+    # --- FIX: ensure audit timers always exist even for early-return paths ---
+    t_aud0 = t0
+    t_aud1 = t0
+    
+    # --- FIX: initialize q_hash early to avoid UnboundLocalError ---
+    q_hash = ""  # Will be updated after question is available
+    
+    # Track optional demo scenario id for UI
+    scenario_id = None
 
     user = auth_user(x_api_key, request=request)
 
     status = "ok"
-    model_name = SETTINGS.model  
+    model_name = SETTINGS.model
+    k = 3  # default
+    mode = "hybrid"  # default
+    warnings: list[str] = []
+    context = ""
+    tool_result = None
+    answer_obj = {}
+    kb_files = 0
+    kb_chunks = 0
+
     try:
         _check_rate_limit(user, SETTINGS.policy)
 
         payload = await request.json()
-        question = str(payload.get("question", "")).strip()
+        question = (payload.get("question") or "").strip()
+
+        if not question:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": {"message": "Missing required field: question"},
+                    "answer": "",
+                    "sources": [],
+                },
+            )
+
+        # --- FIX: set q_hash now that we have question ---
+        q_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+
         k = int(payload.get("k", 3))
         mode = str(payload.get("mode", "hybrid")).strip().lower()
         if mode not in ("kb", "hybrid", "chat"):
             raise HTTPException(status_code=400, detail="Invalid mode. Use: kb | hybrid | chat.")
-
-        warnings: list[str] = []  # move warnings up here
 
         # Public demo: "chat" becomes hybrid (LLM may be disabled)
         if DEMO_MODE and mode == "chat":
             warnings.append("Public demo: advanced LLM is not enabled in this hosted demo; switching to Hybrid.")
             mode = "hybrid"
 
-        # 🔧 Patch 3: DEMO_SCRIPT mode forces scenario_id and canonical question
-        forced_file = None
-        forced_tool = None
+        # ==========================================
+        # SCENARIO_ID: ALWAYS deterministic (方案A, not dependent on DEMO_MODE)
+        # ==========================================
+        scenario_id = str(payload.get("scenario_id", "")).strip() or None
+        if scenario_id:
+            sc = DEMO_SCENARIOS_OLD.get(scenario_id)
+            if not sc:
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "ok": False,
+                        "error": {"message": f"Unknown scenario_id: {scenario_id}"},
+                        "answer": "",
+                        "sources": [],
+                    },
+                )
 
-        if DEMO_MODE and DEMO_SCRIPT_ENABLED:
-            scenario_id = str(payload.get("scenario_id", "")).strip() or None
-            if not scenario_id or scenario_id not in DEMO_SCENARIOS:
-                raise HTTPException(status_code=400, detail="DEMO_SCRIPT enabled: select a scenario (scenario_id).")
+            forced_engine = sc.get("force_engine")   # "tool" | "kb_demo"
+            forced_file = sc.get("force_file")       # e.g. "incident_playbook_sev1.md"
+            forced_tool = sc.get("force_tool")       # ("runbook.get_checklist", {"sev":2})
+            canonical_question = sc.get("canonical_question", "")
 
-            sc = DEMO_SCENARIOS[scenario_id]
-            question = sc["canonical_question"]  # lock question text
-            forced_file = sc.get("force_file")
-            forced_tool = sc.get("force_tool")
+            # If frontend didn't send question, use the scenario's canonical_question
+            if not question:
+                question = canonical_question
+                q_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
 
-        if not question:
-            status = "blocked"
-            raise HTTPException(status_code=400, detail="Missing question.")
+            # Scenarios always go deterministic
+            warnings.append("Scenario run: forced deterministic tool/KB (LLM disabled).")
+            mode = "kb"
 
-        sources: list[dict] = []
-        context = ""
-
-        # ----------------------------
-        # 0) Tool invocation (business layer)
-        # ----------------------------
-        tool_used = None
-        tool_result = None
-
-        # DEMO script tool overrides router (100% stable)
-        if DEMO_MODE and DEMO_SCRIPT_ENABLED and forced_tool:
-            tool_name, tool_args = forced_tool
-            tool_used = tool_name
-
-            if tool_name == "incident.list_open":
-                tool_result = list_open_incidents(question, limit=int(tool_args.get("limit", 10)))
-            elif tool_name == "runbook.get_checklist":
-                tool_result = get_sev_checklist(sev=int(tool_args.get("sev", 2)))
-            else:
-                tool_result = None
-                warnings.append(f"Forced tool not implemented: {tool_name}")
-
-        else:
-            routed = route_tool(question)
-            if routed is not None:
-                tool_name, tool_args = routed
-                tool_used = tool_name
+            # ========== A) Forced TOOL ==========
+            if forced_engine == "tool" and forced_tool:
+                try:
+                    tool_name, tool_args = forced_tool
+                except Exception:
+                    raise HTTPException(status_code=500, detail="Invalid force_tool format. Expected (name, args).")
 
                 if tool_name == "incident.list_open":
                     tool_result = list_open_incidents(question, limit=int(tool_args.get("limit", 10)))
@@ -1362,370 +1112,789 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
                     tool_result = get_sev_checklist(sev=int(tool_args.get("sev", 2)))
                 else:
                     tool_result = None
-                    warnings.append(f"Tool routed but not implemented: {tool_name}")
 
-        # ----------------------------
-        # DEMO MODE: tool-only, no LLM/RAG dependency
-        # ----------------------------
-        if DEMO_MODE and tool_result is None:
-            # KB keyword retrieval (no embeddings, no LLM)
-            async with KB_LOCK:
-                kb_files = len({c["source"] for c in KB_CHUNKS})
-                kb_chunks = len(KB_CHUNKS)
-                # 🔧 Patch 3: first fetch more hits, then filter
-                hits = keyword_topk(question, KB_CHUNKS, k=max(8, k))
+                if tool_result is None or not getattr(tool_result, "ok", False):
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "ok": True,
+                            "request_id": request_id,
+                            "answer": {
+                                "summary": f"Scenario tool failed: {tool_name}",
+                                "steps": [],
+                                "notes": [str(getattr(tool_result, "error", "")) or "Tool returned no result"],
+                                "confidence": 0.35,
+                            },
+                            "sources": [],
+                            "tool": {"used": tool_name, "result": None},
+                            "meta": {"k": k, "mode": "scenario_tool", "kb": {"dir": str(display_source(str(KB_DIR))), "files": 0, "chunks": 0}, "model": None, "engine": "scenario"},
+                            "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": 0, "total": (_now_ms() - t0)},
+                            "warnings": warnings,
+                            "debug": {"scenario_id": scenario_id, "prompt_hash": q_hash},
+                        },
+                    )
 
-                # 🔒 Force to a single KB file for demo stability
-                if forced_file:
-                    filtered = []
-                    for idx, sc in hits:
-                        if Path(KB_CHUNKS[idx].get("source", "")).name == forced_file:
-                            filtered.append((idx, sc))
-                    # if we have matches in that file, use them only
-                    if filtered:
-                        hits = filtered[:k]
-                    else:
-                        # hard fail to avoid "wrong doc" demos
-                        hits = []
-
-            sources = []
-            ctx_lines = []
-            for rank, (i, score) in enumerate(hits, start=1):
-                ch = KB_CHUNKS[i]
-                card = citation_card(ch, score, i)
-                card["rank"] = rank
-                sources.append(card)
-                section = card.get("section") or ""
-                ctx_lines.append(f"[{rank}] {card['source']} {section}")
-
-            # Audit log for demo mode
-            t_aud0 = _now_ms()
-            q_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
-            write_audit({
-                "request_id": request_id,
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "user_id": user.user_id,
-                "role": user.role,
-                "engine": "kb_demo",
-                "model": None,
-                "prompt_hash": q_hash,
-                "status": "ok",
-                "latency_ms": (_now_ms() - t0),
-                "rag": True,
-                "rag_k": k,
-                "rag_sources": [s["source"] for s in sources],
-                "tool_used": None,
-            })
-            t_aud1 = _now_ms()
-
-            # Extract bullets from top chunk (product-oriented)
-            def extract_bullets(text: str, max_items: int = 6) -> list[str]:
-                """
-                Turn a chunk into user-facing bullet steps.
-                Prefers existing list items; falls back to short sentences.
-                Filters out generic headings and favors actionable verbs.
-                """
-                if not text:
-                    return []
-
-                lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-                bullets = []
-                # Skip lines that are just headings or generic descriptors
-                BAD_PREFIX = ("#","##","purpose","this document","severity levels")
-                # Action verbs to prioritize
-                VERBS = ("run","check","notify","assign","declare","restart","validate","document","post","update")
-
-                for ln in lines:
-                    # Skip if line starts with bad prefix
-                    if ln.lower().startswith(BAD_PREFIX):
-                        continue
-                    # markdown list / numbered list
-                    if ln.startswith(("-", "*")):
-                        candidate = ln.lstrip("-* ").strip()
-                        bullets.append(candidate)
-                    elif re.match(r"^\d+[\)\.] ", ln):
-                        candidate = re.sub(r"^\d+[\)\.] ", "", ln).strip()
-                        bullets.append(candidate)
-                    if len(bullets) >= max_items:
-                        return bullets
-
-                # fallback: split sentences roughly, but only keep those with action verbs
-                blob = " ".join(lines)
-                parts = re.split(r"(?<=[\.\?\!])\s+", blob)
-                for p in parts:
-                    p = p.strip()
-                    if p and len(p) >= 12 and any(v in p.lower() for v in VERBS):
-                        bullets.append(p[:180])
-                    if len(bullets) >= max_items:
-                        break
-                return bullets
-
-
-            def best_source_note(src_cards: list[dict]) -> str:
-                if not src_cards:
-                    return "No internal sources were matched."
-                top = src_cards[0]
-                sec = top.get("section") or ""
-                return f"Top evidence: {top.get('source')} {sec}".strip()
-
-
-            # Smart hit selection: prefer specific files for certain queries
-            def pick_best_hit(question: str, hits: list[tuple[int, float]], chunks: list[dict]) -> int | None:
-                q = (question or "").lower()
-                if not hits:
-                    return None
-                # Sev-1 specific: prefer incident_playbook_sev1.md
-                if "sev-1" in q or "sev1" in q:
-                    for i, sc in hits:
-                        if Path(chunks[i].get("source","")).name == "incident_playbook_sev1.md":
-                            return i
-                # Customer update / draft: prefer incident_comms_templates.md
-                if "customer update" in q or "draft" in q:
-                    for i, sc in hits:
-                        if Path(chunks[i].get("source","")).name == "incident_comms_templates.md":
-                            return i
-                # Default to top hit
-                return hits[0][0]
-
-            if sources:
-                top_idx = pick_best_hit(question, hits, KB_CHUNKS) if hits else None
-                top_text = KB_CHUNKS[top_idx]["text"] if top_idx is not None else ""
-                steps = extract_bullets(top_text, max_items=6)
-
-                # Use the enterprise-style template answer generator
-                answer = demo_template_answer(question, steps, sources)
-                warnings.append("DEMO_MODE=1: LLM disabled; deterministic KB retrieval used")
-                status_out = "ok"
-            else:
-                # Optimized no-match prompt
-                answer = {
-                    "summary": "No internal source match found. Try one of the suggested scenarios below.",
-                    "steps": [],
-                    "notes": [
-                        "Try: 'Show me the SEV-2 checklist'",
-                        "Try: 'Handle a SEV-1 incident'",
-                        "Try: 'Gateway overview'",
-                        "Try: 'Why do we use embeddings?'"
-                    ],
-                    "confidence": 0.4,
-                }
-                status_out = "ok"
-                warnings = []
-
-            return {
-                "request_id": request_id,
-                "status": status_out,
-                "answer": answer,
-                "sources": sources,
-                "tool": {"used": None, "result": None},
-                "meta": {
-                    "k": k,
-                    "mode": "verified_kb_only",
-                    "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
-                    "model": None,
-                    "engine": "kb_demo",
-                },
-                "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": max(0, t_aud1 - t_aud0), "total": (_now_ms() - t0)},
-                "warnings": warnings,
-                "debug": {"prompt_hash": q_hash, "rag_enabled": True},
-            }
-
-        # ----------------------------
-        # Deterministic tool response (skip LLM)
-        # ----------------------------
-        if tool_result is not None and tool_result.ok:
-            # deterministic structured answer based on tool type
-            if tool_used == "incident.list_open":
-                answer = {
-                    "summary": f"There are {len(tool_result.data.get('items', []))} open incidents.",
-                    "steps": [
-                        f"{it['id']} - {it['title']} (owner: {it.get('owner', 'unassigned')})"
-                        for it in tool_result.data.get("items", [])
-                    ],
-                    "notes": [],
-                    "confidence": 0.98
-                }
-            elif tool_used == "runbook.get_checklist":
-                items = tool_result.data.get("checklist", [])
-                answer = {
-                    "summary": f"SEV{tool_result.data.get('sev', 2)} checklist retrieved from runbook.",
-                    "steps": items[:8],
-                    "notes": ["Use this checklist to stabilize service before deeper RCA."],
-                    "confidence": 0.98
-                }
-            else:
-                # Fallback for unknown tools
-                answer = {
-                    "summary": f"Tool {tool_used} executed successfully.",
-                    "steps": [],
-                    "notes": [],
-                    "confidence": 0.95
-                }
-
-            # tool mode citations (lightweight, distributed across files)
-            sources: list[dict] = []
-            if getattr(tool_result, "citations_hint", None):
-                # normalize hints to file basenames, keep stable order
-                hint_files: list[str] = []
-                seen_hint = set()
-                for h in tool_result.citations_hint:
-                    name = Path(h).name
-                    if name and name not in seen_hint:
-                        hint_files.append(name)
-                        seen_hint.add(name)
-
-                # Index KB chunks by source filename for quick lookup
-                chunks_by_file: dict[str, list[tuple[int, dict]]] = {}
-                for idx, ch in enumerate(KB_CHUNKS):
-                    fname = Path(ch["source"]).name
-                    chunks_by_file.setdefault(fname, []).append((idx, ch))
-
-                def _make_card(idx: int, ch: dict) -> dict:
-                    return {
-                        "id": f"{display_source(ch['source'])}#{idx}",
-                        "title": pretty_title(ch.get("doc_type", "Document"), ch["source"]),
-                        "doc_type": ch.get("doc_type", "Document"),
-                        "section": ch.get("section", ""),
-                        "score": 1.0,  # tool-citation is "policy reference", not similarity
-                        "source": Path(ch["source"]).name,
-                        "preview": ch.get("text", "")[:260],
-                        "chunk_id": idx,
-                        "rank": 0,  # fill later
+                # tool -> answer
+                if tool_name == "runbook.get_checklist":
+                    data = getattr(tool_result, "data", {}) or {}
+                    items = data.get("checklist", [])
+                    answer_obj = {
+                        "summary": f"SEV{data.get('sev', 2)} checklist retrieved from runbook.",
+                        "steps": items,
+                        "notes": ["Use this checklist to stabilize service before deeper RCA."],
+                        "confidence": 0.98,
                     }
+                elif tool_name == "incident.list_open":
+                    data = getattr(tool_result, "data", {}) or {}
+                    answer_obj = {
+                        "summary": f"There are {len(data.get('items', []))} open incidents.",
+                        "steps": [f"{it['id']} - {it['title']} (owner: {it.get('owner', 'unassigned')})" for it in data.get("items", [])],
+                        "notes": [],
+                        "confidence": 0.98,
+                    }
+                else:
+                    answer_obj = {"summary": f"Tool {tool_name} executed.", "steps": [], "notes": [], "confidence": 0.95}
 
-                # 1) First pass: take 1 chunk per hinted file (best coverage)
-                used_files = set()
-                used_chunk_ids = set()
-                for fname in hint_files:
-                    if fname not in chunks_by_file:
-                        continue
-                    # pick the first chunk for that file (stable)
-                    idx, ch = chunks_by_file[fname][0]
-                    card = _make_card(idx, ch)
-                    sources.append(card)
-                    used_files.add(fname)
-                    used_chunk_ids.add(idx)
-                    if len(sources) >= 3:
-                        break
+                # Clean: remove empty lines/pure numbering
+                answer_obj["steps"] = sanitize_lines(answer_obj.get("steps", []), limit=8)
+                answer_obj["notes"] = sanitize_lines(answer_obj.get("notes", []), limit=6)
 
-                # 2) Second pass: if still < 3, add more chunks from hinted files (next chunks)
-                if len(sources) < 3:
-                    for fname in hint_files:
-                        if fname not in chunks_by_file:
-                            continue
-                        for idx, ch in chunks_by_file[fname][1:]:
-                            if idx in used_chunk_ids:
+                # sources: prioritize using citations_hint to map KB chunks
+                sources = []
+                hint = getattr(tool_result, "citations_hint", None) or []
+                citations = [str(x) for x in hint if x]
+
+                if citations:
+                    hint_files, seen = [], set()
+                    for h in citations:
+                        name = Path(h).name
+                        if name and name not in seen:
+                            hint_files.append(name)
+                            seen.add(name)
+
+                    async with KB_LOCK:
+                        chunks_by_file = {}
+                        for idx, ch in enumerate(KB_CHUNKS):
+                            fname = Path(ch["source"]).name
+                            chunks_by_file.setdefault(fname, []).append((idx, ch))
+
+                        def _make_card(idx, ch):
+                            return {
+                                "id": f"{display_source(ch['source'])}#{idx}",
+                                "title": pretty_title(ch.get("doc_type", "Document"), ch["source"]),
+                                "doc_type": ch.get("doc_type", "Document"),
+                                "section": ch.get("section", ""),
+                                "score": 1.0,
+                                "source": Path(ch["source"]).name,
+                                "preview": ch.get("text", "")[:260],
+                                "chunk_id": idx,
+                                "rank": 0,
+                            }
+
+                        used = set()
+                        for fname in hint_files:
+                            if fname in chunks_by_file:
+                                idx, ch = chunks_by_file[fname][0]
+                                if idx not in used:
+                                    sources.append(_make_card(idx, ch))
+                                    used.add(idx)
+                            if len(sources) >= 3:
+                                break
+
+                        for r, s in enumerate(sources, start=1):
+                            s["rank"] = r
+
+                async with KB_LOCK:
+                    kb_files = len({c["source"] for c in KB_CHUNKS})
+                    kb_chunks = len(KB_CHUNKS)
+
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "ok": True,
+                        "request_id": request_id,
+                        "answer": answer_obj,
+                        "sources": sources,
+                        "tool": {
+                            "used": tool_name,
+                            "result": {
+                                "tool_name": getattr(tool_result, "tool_name", tool_name),
+                                "ok": getattr(tool_result, "ok", None),
+                                "data": getattr(tool_result, "data", None),
+                                "error": getattr(tool_result, "error", None),
+                                "citations_hint": getattr(tool_result, "citations_hint", None),
+                            },
+                        },
+                        "meta": {
+                            "k": k,
+                            "mode": "scenario_tool",
+                            "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
+                            "model": None,
+                            "engine": "scenario",
+                        },
+                        "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": 0, "total": (_now_ms() - t0)},
+                        "warnings": warnings,
+                        "debug": {"scenario_id": scenario_id, "prompt_hash": q_hash},
+                    },
+                )
+
+            # ========== B) Forced KB file ==========
+            if forced_engine == "kb_demo" and forced_file:
+                async with KB_LOCK:
+                    kb_files = len({c["source"] for c in KB_CHUNKS})
+                    kb_chunks = len(KB_CHUNKS)
+
+                    # Only do keyword ranking in the specified file
+                    candidates = []
+                    for idx, ch in enumerate(KB_CHUNKS):
+                        if Path(ch.get("source", "")).name.lower() == forced_file.lower():
+                            candidates.append((idx, ch))
+
+                # Do keyword_topk on candidates only, or filter global hits
+                async with KB_LOCK:
+                    hits_all = keyword_topk(question, KB_CHUNKS, k=max(50, k))
+                hits = [(i, scv) for (i, scv) in hits_all if Path(KB_CHUNKS[i].get("source", "")).name.lower() == forced_file.lower()]
+                hits = hits[:k]
+
+                sources = []
+                if hits:
+                    async with KB_LOCK:
+                        for rank, (i, score) in enumerate(hits, start=1):
+                            ch = KB_CHUNKS[i]
+                            card = citation_card(ch, score, i)
+                            card["rank"] = rank
+                            sources.append(card)
+
+                    # Extract bullets from top chunk
+                    async with KB_LOCK:
+                        top_text = KB_CHUNKS[hits[0][0]].get("text", "") if hits else ""
+                    steps = extract_bullets(top_text, max_items=6) if top_text else []
+                else:
+                    steps = []
+
+                answer_obj = demo_template_answer(question, steps, sources)
+                # Clean empty lines/numbering
+                answer_obj["steps"] = sanitize_lines(answer_obj.get("steps", []), limit=8)
+                answer_obj["notes"] = sanitize_lines(answer_obj.get("notes", []), limit=6)
+
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "ok": True,
+                        "request_id": request_id,
+                        "answer": answer_obj,
+                        "sources": sources,
+                        "tool": {"used": None, "result": None},
+                        "meta": {
+                            "k": k,
+                            "mode": "scenario_kb",
+                            "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
+                            "model": None,
+                            "engine": "scenario",
+                        },
+                        "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": 0, "total": (_now_ms() - t0)},
+                        "warnings": warnings,
+                        "debug": {"scenario_id": scenario_id, "forced_file": forced_file, "prompt_hash": q_hash},
+                    },
+                )
+
+            # If scenario config is incomplete
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "ok": False,
+                    "error": {"message": f"Scenario config incomplete for {scenario_id}"},
+                    "answer": "",
+                    "sources": [],
+                },
+            )
+
+        # ==========================================
+        # END SCENARIO_ID BLOCK
+        # ==========================================
+
+        # Extract scenario_id, used to determine if this is a scenario run
+        scenario_id = str(payload.get("scenario_id", "")).strip() or None
+
+        # If this is a demo scenario request: force deterministic (KB/tool), never connect to vLLM
+        IS_SCENARIO_RUN = bool(scenario_id)
+        if IS_SCENARIO_RUN:
+            # Frontend may send hybrid/chat, but for scenario runs we downgrade to kb (or tool)
+            if mode in ("hybrid", "chat"):
+                warnings.append("Scenario run: forcing deterministic KB/tool mode (LLM disabled).")
+                mode = "kb"
+
+        # ----------------------------
+        # DEMO_SCRIPT mode (scenario_id driven)
+        # ----------------------------
+        forced_file = None
+        forced_tool = None
+        forced_engine = None
+
+        if DEMO_MODE and DEMO_SCRIPT_ENABLED:
+            if not scenario_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="DEMO_SCRIPT enabled: scenario_id required."
+                )
+
+            if scenario_id not in DEMO_SCENARIOS_OLD:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Unknown scenario_id: {scenario_id}"
+                )
+
+            sc = DEMO_SCENARIOS_OLD[scenario_id]
+
+            forced_engine = sc.get("force_engine")
+            forced_file = sc.get("force_file")
+            forced_tool = sc.get("force_tool")
+
+            if not question:
+                question = sc.get("canonical_question", "")
+                q_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+
+        # =========================
+        # 1) ROUTE TOOL (your logic)
+        # =========================
+        # Your original logic: route_tool(question) -> ("runbook.get_checklist", {"sev": 2})
+        tool_route = route_tool(question)
+        if tool_route:
+            tool_name, tool_args = tool_route
+
+        # =========================
+        # 2) EXECUTE TOOL (your logic)
+        # =========================
+        if tool_name:
+            # Here's a generic approach: your tools generally return MockToolResult / ToolResult
+            # Assume the returned object has ok / data / citations_hint
+            if tool_name == "runbook.get_checklist":
+                sev = int(tool_args.get("sev", 2))
+                tool_result = get_sev_checklist(sev=sev)
+
+            elif tool_name == "incident.list_open":
+                limit = int(tool_args.get("limit", 10))
+                tool_result = list_open_incidents(question, limit=limit)
+
+            else:
+                # Or you have a unified route_tool + execute_tool
+                # tool_result = execute_tool(tool_name, tool_args)
+                warnings.append(f"Tool routed but not implemented: {tool_name}")
+                tool_result = None
+
+            if tool_result is not None and getattr(tool_result, "ok", False):
+                # Convert tool result to answer text (following your project's format)
+                if tool_name == "incident.list_open":
+                    data = getattr(tool_result, "data", {}) or {}
+                    answer_obj = {
+                        "summary": f"There are {len(data.get('items', []))} open incidents.",
+                        "steps": [
+                            f"{it['id']} - {it['title']} (owner: {it.get('owner', 'unassigned')})"
+                            for it in data.get("items", [])
+                        ],
+                        "notes": [],
+                        "confidence": 0.98
+                    }
+                    # Sanitize steps and notes
+                    answer_obj["steps"] = sanitize_lines(answer_obj.get("steps", []), limit=8)
+                    answer_obj["notes"] = sanitize_lines(answer_obj.get("notes", []), limit=6)
+                    answer_text = json.dumps(answer_obj, ensure_ascii=False)
+                elif tool_name == "runbook.get_checklist":
+                    data = getattr(tool_result, "data", {}) or {}
+                    items = data.get("checklist", [])
+                    answer_obj = {
+                        "summary": f"SEV{data.get('sev', 2)} checklist retrieved from runbook.",
+                        "steps": items[:8],
+                        "notes": ["Use this checklist to stabilize service before deeper RCA."],
+                        "confidence": 0.98
+                    }
+                    # Sanitize steps and notes
+                    answer_obj["steps"] = sanitize_lines(answer_obj.get("steps", []), limit=8)
+                    answer_obj["notes"] = sanitize_lines(answer_obj.get("notes", []), limit=6)
+                    answer_text = json.dumps(answer_obj, ensure_ascii=False)
+                else:
+                    answer_obj = {
+                        "summary": f"Tool {tool_name} executed successfully.",
+                        "steps": [],
+                        "notes": [],
+                        "confidence": 0.95
+                    }
+                    # Sanitize steps and notes
+                    answer_obj["steps"] = sanitize_lines(answer_obj.get("steps", []), limit=8)
+                    answer_obj["notes"] = sanitize_lines(answer_obj.get("notes", []), limit=6)
+                    answer_text = json.dumps(answer_obj, ensure_ascii=False)
+
+                # citations_hint -> sources (if this is how you designed it)
+                hint = getattr(tool_result, "citations_hint", None) or []
+                if isinstance(hint, list):
+                    citations.extend([str(x) for x in hint if x])
+                    
+                # Build sources from citations_hint
+                if citations:
+                    # normalize hints to file basenames, keep stable order
+                    hint_files: list[str] = []
+                    seen_hint = set()
+                    for h in citations:
+                        name = Path(h).name
+                        if name and name not in seen_hint:
+                            hint_files.append(name)
+                            seen_hint.add(name)
+
+                    # Index KB chunks by source filename for quick lookup
+                    async with KB_LOCK:
+                        chunks_by_file: dict[str, list[tuple[int, dict]]] = {}
+                        for idx, ch in enumerate(KB_CHUNKS):
+                            fname = Path(ch["source"]).name
+                            chunks_by_file.setdefault(fname, []).append((idx, ch))
+
+                        def _make_card(idx: int, ch: dict) -> dict:
+                            return {
+                                "id": f"{display_source(ch['source'])}#{idx}",
+                                "title": pretty_title(ch.get("doc_type", "Document"), ch["source"]),
+                                "doc_type": ch.get("doc_type", "Document"),
+                                "section": ch.get("section", ""),
+                                "score": 1.0,  # tool-citation is "policy reference", not similarity
+                                "source": Path(ch["source"]).name,
+                                "preview": ch.get("text", "")[:260],
+                                "chunk_id": idx,
+                                "rank": 0,  # fill later
+                            }
+
+                        # 1) First pass: take 1 chunk per hinted file (best coverage)
+                        used_files = set()
+                        used_chunk_ids = set()
+                        for fname in hint_files:
+                            if fname not in chunks_by_file:
                                 continue
-                            sources.append(_make_card(idx, ch))
+                            # pick the first chunk for that file (stable)
+                            idx, ch = chunks_by_file[fname][0]
+                            card = _make_card(idx, ch)
+                            sources.append(card)
+                            used_files.add(fname)
                             used_chunk_ids.add(idx)
                             if len(sources) >= 3:
                                 break
-                        if len(sources) >= 3:
-                            break
 
-                # 3) Third pass: if still < 3, fallback to any other KB files (broad evidence)
-                if len(sources) < 3:
-                    for idx, ch in enumerate(KB_CHUNKS):
-                        if idx in used_chunk_ids:
-                            continue
-                        fname = Path(ch["source"]).name
-                        if fname in used_files:
-                            continue
-                        sources.append(_make_card(idx, ch))
-                        used_files.add(fname)
-                        used_chunk_ids.add(idx)
-                        if len(sources) >= 3:
-                            break
+                        # 2) Second pass: if still < 3, add more chunks from hinted files (next chunks)
+                        if len(sources) < 3:
+                            for fname in hint_files:
+                                if fname not in chunks_by_file:
+                                    continue
+                                for idx, ch in chunks_by_file[fname][1:]:
+                                    if idx in used_chunk_ids:
+                                        continue
+                                    sources.append(_make_card(idx, ch))
+                                    used_chunk_ids.add(idx)
+                                    if len(sources) >= 3:
+                                        break
+                                if len(sources) >= 3:
+                                    break
 
-                # Final: assign ranks
-                for r, s in enumerate(sources, start=1):
-                    s["rank"] = r
+                        # 3) Third pass: if still < 3, fallback to any other KB files (broad evidence)
+                        if len(sources) < 3:
+                            for idx, ch in enumerate(KB_CHUNKS):
+                                if idx in used_chunk_ids:
+                                    continue
+                                fname = Path(ch["source"]).name
+                                if fname in used_files:
+                                    continue
+                                sources.append(_make_card(idx, ch))
+                                used_files.add(fname)
+                                used_chunk_ids.add(idx)
+                                if len(sources) >= 3:
+                                    break
 
-            t_aud0 = _now_ms()
-            # Audit
-            q_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
-            write_audit({
-                "request_id": request_id,
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "user_id": user.user_id,
-                "role": user.role,
-                "engine": "tool",
-                "model": None,
-                "prompt_hash": q_hash,
-                "status": "ok",
-                "latency_ms": (t_aud0 - t0),
-                "rag": bool(sources),
-                "rag_k": k,
-                "rag_sources": [s["source"] for s in sources],
-                "tool_used": tool_used,
-            })
-            t_aud1 = _now_ms()
+                        # Final: assign ranks
+                        for r, s in enumerate(sources, start=1):
+                            s["rank"] = r
 
-            async with KB_LOCK:
-                kb_files = len({c["source"] for c in KB_CHUNKS})
-                kb_chunks = len(KB_CHUNKS)
-            
-            if kb_chunks == 0:
-                return {
+                # Audit
+                t_aud0 = _now_ms()
+                write_audit({
                     "request_id": request_id,
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "user_id": user.user_id,
+                    "role": user.role,
+                    "engine": "tool",
+                    "model": None,
+                    "prompt_hash": q_hash,
                     "status": "ok",
-                    "answer": {
-                        "summary": "KB is still loading. Please retry in a few seconds.",
-                        "steps": [],
-                        "notes": ["This demo indexes markdown KB on startup."],
-                        "confidence": 0.4,
-                    },
-                    "sources": [],
-                    "tool": {"used": None, "result": None},
-                    "meta": {"k": k, "mode": "demo_kb_only", "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks}, "model": None, "engine": "kb_demo"},
-                    "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": 0, "total": (_now_ms() - t0)},
-                    "warnings": ["KB indexing in progress"],
-                    "debug": {"rag_enabled": True},
+                    "latency_ms": (t_aud0 - t0),
+                    "rag": bool(sources),
+                    "rag_k": k,
+                    "rag_sources": [s.get("source", "") for s in sources],
+                    "tool_used": tool_name,
+                })
+                t_aud1 = _now_ms()
+
+                async with KB_LOCK:
+                    kb_files = len({c["source"] for c in KB_CHUNKS})
+                    kb_chunks = len(KB_CHUNKS)
+
+                t1 = _now_ms()
+                total_ms = max(1, t1 - t0)
+                audit_ms = max(0, t_aud1 - t_aud0)
+
+                timings = {
+                    "embed": 0,
+                    "retrieve": 0,
+                    "llm": 0,
+                    "audit": audit_ms,
+                    "total": total_ms,
                 }
 
-            t1 = _now_ms()
-            total_ms = max(1, t1 - t0)
-            audit_ms = max(0, t_aud1 - t_aud0)
+                resp = {
+                    "ok": True,
+                    "request_id": request_id,
+                    "answer": answer_obj,
+                    "sources": sources,
+                    "tool": {
+                        "used": tool_name,
+                        "result": {
+                            "tool_name": tool_result.tool_name,
+                            "ok": tool_result.ok,
+                            "data": tool_result.data,
+                            "error": tool_result.error,
+                            "citations_hint": getattr(tool_result, "citations_hint", None)
+                        }
+                    },
+                    "meta": {
+                        "k": k,
+                        "mode": "tool",
+                        "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
+                        "model": None,
+                        "engine": "tool",
+                    },
+                    "timings_ms": timings,
+                    "warnings": warnings,
+                    "debug": {"prompt_hash": q_hash, "rag_enabled": False, "evidence_enabled": bool(sources), "tool_used": tool_name},
+                }
 
-            # IMPORTANT: calculate total timing before return
-            timings = {
-                "embed": 0,
-                "retrieve": 0,
-                "llm": 0,
-                "audit": audit_ms,
-                "total": total_ms,
-            }
+                # If DEMO_MODE, include debug info
+                if os.getenv("DEMO_MODE", "0") == "1":
+                    resp["debug"].update({
+                        "tool_name": tool_name,
+                        "tool_args": tool_args,
+                    })
 
-            return {
-                "request_id": request_id,
-                "status": "ok",
-                "answer": answer,
-                "sources": sources,
-                "tool": {
-                    "used": tool_used,
-                    "result": {
-                        "tool_name": tool_result.tool_name,
-                        "ok": tool_result.ok,
-                        "data": tool_result.data,
-                        "error": tool_result.error,
-                        "citations_hint": getattr(tool_result, "citations_hint", None)
+                return JSONResponse(status_code=200, content=resp)
+
+            else:
+                # Tool failed, return stable structure
+                err = getattr(tool_result, "error", None) or "Tool failed"
+                answer_text = f"Tool error: {err}"
+                warnings.append(f"Tool error: {err}")
+
+        # ----------------------------
+        # DEMO MODE: tool-only, no LLM/RAG dependency
+        # (This only runs if no tool was invoked above)
+        # ----------------------------
+        if DEMO_MODE and tool_result is None:
+
+            # ==========================
+            # DEMO_SCRIPT forced tool: tuple form ("tool.name", {args})
+            # ==========================
+            if forced_engine == "tool" and forced_tool:
+                try:
+                    tool_name, tool_args = forced_tool  # tuple unpack
+                except Exception:
+                    raise HTTPException(status_code=500, detail="Invalid force_tool format. Expected (name, args).")
+
+                if tool_name == "incident.list_open":
+                    tool_result = list_open_incidents(question, limit=int(tool_args.get("limit", 10)))
+                elif tool_name == "runbook.get_checklist":
+                    tool_result = get_sev_checklist(sev=int(tool_args.get("sev", 2)))
+                else:
+                    warnings.append(f"Forced tool not implemented: {tool_name}")
+                    tool_result = None
+
+                if tool_result is not None and tool_result.ok:
+                    # Build answer (same logic as your tool-early-return)
+                    if tool_name == "incident.list_open":
+                        answer_obj = {
+                            "summary": f"There are {len(tool_result.data.get('items', []))} open incidents.",
+                            "steps": [
+                                f"{it['id']} - {it['title']} (owner: {it.get('owner', 'unassigned')})"
+                                for it in tool_result.data.get("items", [])
+                            ],
+                            "notes": [],
+                            "confidence": 0.98,
+                        }
+                    elif tool_name == "runbook.get_checklist":
+                        items = tool_result.data.get("checklist", [])
+                        answer_obj = {
+                            "summary": f"SEV{tool_result.data.get('sev', 2)} checklist retrieved from runbook.",
+                            "steps": items[:8],
+                            "notes": ["Use this checklist to stabilize service before deeper RCA."],
+                            "confidence": 0.98,
+                        }
+                    else:
+                        answer_obj = {"summary": f"Tool {tool_name} executed successfully.", "steps": [], "notes": [], "confidence": 0.95}
+                    
+                    # Sanitize steps and notes
+                    answer_obj["steps"] = sanitize_lines(answer_obj.get("steps", []), limit=8)
+                    answer_obj["notes"] = sanitize_lines(answer_obj.get("notes", []), limit=6)
+
+                    # Optional: reuse your citations_hint -> sources builder here
+                    sources = []
+                    if getattr(tool_result, "citations_hint", None):
+                        # normalize hints to file basenames, keep stable order
+                        hint_files: list[str] = []
+                        seen_hint = set()
+                        for h in tool_result.citations_hint:
+                            name = Path(h).name
+                            if name and name not in seen_hint:
+                                hint_files.append(name)
+                                seen_hint.add(name)
+
+                        # Index KB chunks by source filename for quick lookup
+                        chunks_by_file: dict[str, list[tuple[int, dict]]] = {}
+                        async with KB_LOCK:
+                            for idx, ch in enumerate(KB_CHUNKS):
+                                fname = Path(ch["source"]).name
+                                chunks_by_file.setdefault(fname, []).append((idx, ch))
+
+                            def _make_card(idx: int, ch: dict) -> dict:
+                                return {
+                                    "id": f"{display_source(ch['source'])}#{idx}",
+                                    "title": pretty_title(ch.get("doc_type", "Document"), ch["source"]),
+                                    "doc_type": ch.get("doc_type", "Document"),
+                                    "section": ch.get("section", ""),
+                                    "score": 1.0,
+                                    "source": Path(ch["source"]).name,
+                                    "preview": ch.get("text", "")[:260],
+                                    "chunk_id": idx,
+                                    "rank": 0,
+                                }
+
+                            # 1) First pass: take 1 chunk per hinted file
+                            used_files = set()
+                            used_chunk_ids = set()
+                            for fname in hint_files:
+                                if fname not in chunks_by_file:
+                                    continue
+                                idx, ch = chunks_by_file[fname][0]
+                                card = _make_card(idx, ch)
+                                sources.append(card)
+                                used_files.add(fname)
+                                used_chunk_ids.add(idx)
+                                if len(sources) >= 3:
+                                    break
+
+                            # 2) Second pass: if still < 3, add more chunks from hinted files
+                            if len(sources) < 3:
+                                for fname in hint_files:
+                                    if fname not in chunks_by_file:
+                                        continue
+                                    for idx, ch in chunks_by_file[fname][1:]:
+                                        if idx in used_chunk_ids:
+                                            continue
+                                        sources.append(_make_card(idx, ch))
+                                        used_chunk_ids.add(idx)
+                                        if len(sources) >= 3:
+                                            break
+                                    if len(sources) >= 3:
+                                        break
+
+                            # 3) Third pass: if still < 3, fallback to any other KB files
+                            if len(sources) < 3:
+                                for idx, ch in enumerate(KB_CHUNKS):
+                                    if idx in used_chunk_ids:
+                                        continue
+                                    fname = Path(ch["source"]).name
+                                    if fname in used_files:
+                                        continue
+                                    sources.append(_make_card(idx, ch))
+                                    used_files.add(fname)
+                                    used_chunk_ids.add(idx)
+                                    if len(sources) >= 3:
+                                        break
+
+                            for r, s in enumerate(sources, start=1):
+                                s["rank"] = r
+
+                    t_aud0 = _now_ms()
+                    write_audit({
+                        "request_id": request_id,
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "user_id": user.user_id,
+                        "role": user.role,
+                        "engine": "kb_demo_tool",
+                        "model": None,
+                        "prompt_hash": q_hash,
+                        "status": "ok",
+                        "latency_ms": (_now_ms() - t0),
+                        "rag": bool(sources),
+                        "rag_k": k,
+                        "rag_sources": [s.get("source", "") for s in sources],
+                        "tool_used": tool_name,
+                    })
+                    t_aud1 = _now_ms()
+
+                    async with KB_LOCK:
+                        kb_files = len({c["source"] for c in KB_CHUNKS})
+                        kb_chunks = len(KB_CHUNKS)
+
+                    resp = {
+                        "ok": True,
+                        "request_id": request_id,
+                        "answer": answer_obj,
+                        "sources": sources,
+                        "tool": {
+                            "used": tool_name,
+                            "result": {
+                                "tool_name": tool_result.tool_name,
+                                "ok": tool_result.ok,
+                                "data": tool_result.data,
+                                "error": tool_result.error,
+                                "citations_hint": getattr(tool_result, "citations_hint", None),
+                            },
+                        },
+                        "meta": {
+                            "k": k,
+                            "mode": "tool",
+                            "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
+                            "model": None,
+                            "engine": "tool",
+                        },
+                        "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": max(0, t_aud1 - t_aud0), "total": (_now_ms() - t0)},
+                        "warnings": warnings + ["DEMO_MODE=1: tool-first deterministic response used"],
+                        "debug": {"prompt_hash": q_hash, "rag_enabled": False, "tool_used": tool_name},
                     }
-                },
-                "meta": {
-                    "k": k,
-                    "mode": "tool",
-                    "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
-                    "model": None,
-                    "engine": "tool",
-                },
-                "timings_ms": timings,
-                "warnings": warnings,
-                "debug": {"prompt_hash": q_hash, "rag_enabled": False,"evidence_enabled": bool(sources), "tool_used": tool_used},
-            }
 
-        # ----------------------------
-        # 1) RAG retrieval (only if no tool or tool failed)
-        # ----------------------------
+                    return JSONResponse(status_code=200, content=resp)
+
+                # KB keyword retrieval (no embeddings, no LLM)
+                async with KB_LOCK:
+                    kb_files = len({c["source"] for c in KB_CHUNKS})
+                    kb_chunks = len(KB_CHUNKS)
+                    # first fetch more hits, then filter
+                    hits = keyword_topk(question, KB_CHUNKS, k=max(20, k)) 
+
+                    # Force to a single KB file for demo stability
+                    if forced_file:
+                        filtered = [
+                            (idx, sc) for idx, sc in hits
+                            if Path(KB_CHUNKS[idx].get("source","")).name.lower() == forced_file.lower()
+                        ]
+                        if not filtered:
+                            # fallback: scan ALL chunks for that file, then rank by keyword score
+                            candidates = []
+                            for idx, ch in enumerate(KB_CHUNKS):
+                                if Path(ch.get("source","")).name.lower() == forced_file.lower():
+                                    candidates.append(idx)
+                            if candidates:
+                                filtered = [(idx, 1.0) for idx in candidates[:k]]
+
+                        hits = filtered[:k]
+
+                sources = []
+                ctx_lines = []
+                for rank, (i, score) in enumerate(hits, start=1):
+                    ch = KB_CHUNKS[i]
+                    card = citation_card(ch, score, i)
+                    card["rank"] = rank
+                    sources.append(card)
+                    section = card.get("section") or ""
+                    ctx_lines.append(f"[{rank}] {card['source']} {section}")
+
+                # Audit log for demo mode
+                t_aud0 = _now_ms()
+                write_audit({
+                    "request_id": request_id,
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "user_id": user.user_id,
+                    "role": user.role,
+                    "engine": "kb_demo",
+                    "model": None,
+                    "prompt_hash": q_hash,
+                    "status": "ok",
+                    "latency_ms": (_now_ms() - t0),
+                    "rag": True,
+                    "rag_k": k,
+                    "rag_sources": [s.get("source", "") for s in sources],
+                    "tool_used": None,
+                })
+                t_aud1 = _now_ms()
+
+                def best_source_note(src_cards: list[dict]) -> str:
+                    if not src_cards:
+                        return "No internal sources were matched."
+                    top = src_cards[0]
+                    sec = top.get("section") or ""
+                    return f"Top evidence: {top.get('source')} {sec}".strip()
+
+                # Smart hit selection: prefer specific files for certain queries
+                def pick_best_hit(question: str, hits: list[tuple[int, float]], chunks: list[dict]) -> int | None:
+                    q = (question or "").lower()
+                    if not hits:
+                        return None
+                    # Sev-1 specific: prefer incident_playbook_sev1.md
+                    if "sev-1" in q or "sev1" in q:
+                        for i, sc in hits:
+                            if Path(chunks[i].get("source","")).name == "incident_playbook_sev1.md":
+                                return i
+                    # Customer update / draft: prefer incident_comms_templates.md
+                    if "customer update" in q or "draft" in q:
+                        for i, sc in hits:
+                            if Path(chunks[i].get("source","")).name == "incident_comms_templates.md":
+                                return i
+                    # Default to top hit
+                    return hits[0][0]
+
+                if sources:
+                    top_idx = pick_best_hit(question, hits, KB_CHUNKS) if hits else None
+                    top_text = KB_CHUNKS[top_idx]["text"] if top_idx is not None else ""
+                    steps = extract_bullets(top_text, max_items=6)
+
+                    # Use the enterprise-style template answer generator
+                    answer_obj = demo_template_answer(question, steps, sources)
+                    warnings = ["DEMO_MODE=1: LLM disabled; deterministic KB retrieval used"]
+                    status_out = "ok"
+                else:
+                    # Optimized no-match prompt
+                    answer_obj = {
+                        "summary": "No internal source match found. Try one of the suggested scenarios below.",
+                        "steps": [],
+                        "notes": [
+                            "Try: 'Show me the SEV-2 checklist'",
+                            "Try: 'Handle a SEV-1 incident'",
+                            "Try: 'Gateway overview'",
+                            "Try: 'Why do we use embeddings?'"
+                        ],
+                        "confidence": 0.4,
+                    }
+                    status_out = "ok"
+                    warnings = []
+
+                async with KB_LOCK:
+                    kb_files = len({c["source"] for c in KB_CHUNKS})
+                    kb_chunks = len(KB_CHUNKS)
+
+                resp = {
+                    "ok": True,
+                    "request_id": request_id,
+                    "answer": answer_obj,
+                    "sources": sources,
+                    "tool": {"used": None, "result": None},
+                    "meta": {
+                        "k": k,
+                        "mode": "verified_kb_only",
+                        "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
+                        "model": None,
+                        "engine": "kb",
+                    },
+                    "timings_ms": {"embed": 0, "retrieve": 0, "llm": 0, "audit": max(0, t_aud1 - t_aud0), "total": (_now_ms() - t0)},
+                    "warnings": warnings,
+                    "debug": {"prompt_hash": q_hash, "rag_enabled": True},
+                }
+
+                return JSONResponse(status_code=200, content=resp)
+
+        # =========================
+        # 3) LLM NORMAL PATH (your logic)
+        # =========================
+        # RAG retrieval
         t_embed0 = _now_ms()
         async with KB_LOCK:
             has_kb = (KB_EMB is not None and bool(KB_CHUNKS))
@@ -1754,21 +1923,9 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         else:
             warnings.append("KB index is empty or not loaded. Answer may be ungrounded.")
 
-        # tool context (prepend, so model sees it first) - for failed tools only
-        if tool_result is not None and not tool_result.ok and tool_result.error:
-            tool_block = (
-                f"TOOL_ERROR ({tool_used}):\n"
-                f"{tool_result.error}\n"
-                "The tool failed. Answer based on other context if available.\n"
-            )
-            context = tool_block + "\n\n" + context
-
         t_ret1 = _now_ms()
 
-        # ----------------------------
-        # 2) LLM call (force UI JSON)
-        # ----------------------------
-        # Mode controls how strictly we rely on retrieved context.
+        # LLM call
         if mode == "kb":
             system_prompt = (
                 "You are a helpful internal assistant.\n"
@@ -1818,15 +1975,85 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         }
 
         t_llm0 = _now_ms()
-        timeout = httpx.Timeout(SETTINGS.policy.timeout_seconds)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(url, json=vllm_payload)
-            r.raise_for_status()
-            out = r.json()
-        t_llm1 = _now_ms()
+        t_llm1 = t_llm0
+        try:
+            timeout = httpx.Timeout(SETTINGS.policy.timeout_seconds)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(url, json=vllm_payload)
+                r.raise_for_status()
+                out = r.json()
+            t_llm1 = _now_ms()
 
-        raw_answer = out["choices"][0]["message"]["content"]
-        answer_obj = safe_parse_ui_json(raw_answer)
+            raw_answer = out["choices"][0]["message"]["content"]
+            answer_obj = safe_parse_ui_json(raw_answer)
+
+        except httpx.RequestError as e:
+            # vLLM unavailable: don't return 500, fallback to deterministic KB (keyword) answer
+            warnings.append(f"LLM backend unavailable, falling back to KB only. ({type(e).__name__})")
+
+            async with KB_LOCK:
+                kb_files = len({c["source"] for c in KB_CHUNKS})
+                kb_chunks = len(KB_CHUNKS)
+                hits = keyword_topk(question, KB_CHUNKS, k=max(20, k))
+
+            sources = []
+            for rank, (i, score) in enumerate(hits[:k], start=1):
+                ch = KB_CHUNKS[i]
+                card = citation_card(ch, score, i)
+                card["rank"] = rank
+                sources.append(card)
+
+            # Create a short readable deterministic answer
+            top_text = KB_CHUNKS[hits[0][0]]["text"] if hits else ""
+            steps = []
+            if top_text:
+                # Reuse your demo extract_bullets idea (simplified)
+                lines = [ln.strip() for ln in top_text.splitlines() if ln.strip()]
+                for ln in lines:
+                    if ln.startswith(("-", "*")):
+                        candidate = ln.lstrip("-* ").strip()
+                        # Filter out pure number lines
+                        if re.fullmatch(r"\d+[\.\)]?", candidate):
+                            continue
+                        steps.append(candidate)
+                    if len(steps) >= 6:
+                        break
+
+            answer_obj = demo_template_answer(question, steps, sources) if sources else {
+                "summary": "LLM backend unavailable and no KB match found.",
+                "steps": [],
+                "notes": ["Start vLLM or run in DEMO_MODE for deterministic demos."],
+                "confidence": 0.35,
+            }
+
+            # Return directly with 200 (don't continue further)
+            t1 = _now_ms()
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "ok": True,
+                    "request_id": request_id,
+                    "answer": answer_obj,
+                    "sources": sources,
+                    "tool": {"used": tool_name, "result": None},
+                    "meta": {
+                        "k": k,
+                        "mode": "kb_fallback",
+                        "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
+                        "model": None,
+                        "engine": "kb_fallback",
+                    },
+                    "timings_ms": {
+                        "embed": 0,
+                        "retrieve": 0,
+                        "llm": max(0, t_llm1 - t_llm0),
+                        "audit": 0,
+                        "total": (t1 - t0),
+                    },
+                    "warnings": warnings,
+                    "debug": {"prompt_hash": q_hash, "rag_enabled": True},
+                },
+            )
 
         if mode == "hybrid" and not sources:
             # Make it explicit when we answered without internal citations.
@@ -1834,12 +2061,8 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
             if isinstance(answer_obj["notes"], list):
                 answer_obj["notes"].append("No internal KB sources were retrieved for this question; answer may be general.")
 
-
-        # ----------------------------
-        # 3) Audit (no raw prompt)
-        # ----------------------------
+        # Audit
         t_aud0 = _now_ms()
-        q_hash = hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
         write_audit({
             "request_id": request_id,
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1853,7 +2076,7 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
             "rag": has_kb,
             "rag_k": k if has_kb else None,
             "rag_sources": list({s.get("source") for s in sources if s.get("source")}),
-            "tool_used": tool_used,
+            "tool_used": tool_name,
         })
         t_aud1 = _now_ms()
 
@@ -1864,30 +2087,30 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         t1 = _now_ms()
 
         # Determine execution mode
-        if tool_used:
-            mode = "tool+llm"  # tool was used but failed, so fell back to LLM
+        if tool_name:
+            mode_display = "tool+llm"  # tool was used but failed, so fell back to LLM
         elif has_kb:
-            mode = "rag+llm"
+            mode_display = "rag+llm"
         else:
-            mode = "llm"
+            mode_display = "llm"
 
-        return {
+        resp = {
+            "ok": True,
             "request_id": request_id,
-            "status": "ok",
             "answer": answer_obj,
             "sources": sources,
             "tool": {
-                "used": tool_used,
+                "used": tool_name,
                 "result": None if tool_result is None else {
-                    "tool_name": tool_result.tool_name,
-                    "ok": tool_result.ok,
-                    "data": tool_result.data,
-                    "error": tool_result.error,
+                    "tool_name": tool_result.tool_name if hasattr(tool_result, "tool_name") else tool_name,
+                    "ok": tool_result.ok if hasattr(tool_result, "ok") else None,
+                    "data": tool_result.data if hasattr(tool_result, "data") else None,
+                    "error": tool_result.error if hasattr(tool_result, "error") else None,
                 }
             },
             "meta": {
                 "k": k,
-                "mode": mode,
+                "mode": mode_display,
                 "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
                 "model": SETTINGS.model,
                 "engine": "vllm",
@@ -1903,130 +2126,37 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
             "debug": {"prompt_hash": q_hash, "rag_enabled": bool(has_kb)},
         }
 
+        # If DEMO_MODE, include debug info
+        if os.getenv("DEMO_MODE", "0") == "1":
+            resp["debug"].update({
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+            })
+
+        return JSONResponse(status_code=200, content=resp)
+
     except HTTPException as e:
-        # 400/401/403/429/… blocked or error
-        if e.status_code in (400, 401, 403, 429):
-            status = "blocked" if e.status_code != 429 else "blocked"
-        else:
-            status = "error"
-        raise
-
-    except httpx.ReadTimeout:
-        status = "timeout"
-        raise HTTPException(status_code=504, detail="Inference timeout.")
-
-    except Exception:
-        status = "error"
-        raise
-
-    finally:
-        # Minimum interpretable metric: latency+number of requests
-        latency_ms = _now_ms() - t0
-        LAT_MS.labels(role=user.role, model=model_name).observe(latency_ms)
-        REQ_TOTAL.labels(status=status, role=user.role, model=model_name).inc()
-
-
-
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/metrics")
-def metrics():
-    data = generate_latest()
-    return PlainTextResponse(data.decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request, x_api_key: Optional[str] = Header(default=None)):
-    req_id = str(uuid.uuid4())
-    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    start = time.time()
-
-    user = auth_user(x_api_key, request=request)
-    _check_rate_limit(user, SETTINGS.policy)
-
-    payload = await request.json()
-
-    # ---- policy: input length ----
-    msgs = payload.get("messages", [])
-    full_text = "".join([str(m.get("content", "")) for m in msgs])
-    input_chars = len(full_text)
-    prompt_hash = compute_prompt_hash(msgs)
-
-    if input_chars > SETTINGS.policy.max_input_chars:
-        write_audit({
-            "request_id": req_id, "ts": ts,
-            "user_id": user.user_id, "role": user.role,
-            "engine": "vllm", "model": payload.get("model", ""),
-            "prompt_hash": prompt_hash,
-            "input_chars": input_chars,
-            "status": "blocked", "reason": "max_input_chars",
-        })
-        REQ_TOTAL.labels(status="blocked", role=user.role, model=payload.get("model", "unknown")).inc()
-        raise HTTPException(status_code=400, detail="Input too large for internal policy.")
-
-    # ---- policy: max_tokens by role ----
-    max_tokens = payload.get("max_tokens")
-    if max_tokens is None:
-        payload["max_tokens"] = SETTINGS.policy.max_tokens_admin if user.role == "admin" else SETTINGS.policy.max_tokens_default
-    else:
-        cap = SETTINGS.policy.max_tokens_admin if user.role == "admin" else SETTINGS.policy.max_tokens_default
-        if int(max_tokens) > cap:
-            payload["max_tokens"] = cap
-
-    # ---- forward to vLLM OpenAI server ----
-    url = f"{SETTINGS.vllm_base_url}/v1/chat/completions"
-    model_name = payload.get("model", "unknown")
-
-    status = "ok"
-    err_type = ""
-    try:
-        timeout = httpx.Timeout(SETTINGS.policy.timeout_seconds)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, json=payload)
-            if resp.status_code >= 400:
-                status = "error"
-                err_type = f"downstream_{resp.status_code}"
-                ERR_TOTAL.labels(type=err_type).inc()
-                body = resp.text
-                raise HTTPException(status_code=502, detail=f"Downstream error: {body[:200]}")
-            data = resp.json()
-    except httpx.ReadTimeout:
-        status = "timeout"
-        err_type = "timeout"
-        ERR_TOTAL.labels(type=err_type).inc()
-        raise HTTPException(status_code=504, detail="Inference timeout.")
-    except httpx.ConnectError:
-        status = "error"
-        err_type = "connect_error"
-        ERR_TOTAL.labels(type=err_type).inc()
-        raise HTTPException(status_code=502, detail="Cannot reach inference backend.")
-    finally:
-        latency_ms = int((time.time() - start) * 1000)
-        LAT_MS.labels(role=user.role, model=model_name).observe(latency_ms)
-        REQ_TOTAL.labels(status=status, role=user.role, model=model_name).inc()
-
-        write_audit({
-            "request_id": req_id,
-            "ts": ts,
-            "user_id": user.user_id,
-            "role": user.role,
-            "engine": "vllm",
-            "model": model_name,
-            "prompt_hash": prompt_hash,
-            "input_chars": input_chars,
-            "max_tokens": payload.get("max_tokens"),
-            "latency_ms": latency_ms,
-            "status": status,
-            "error_type": err_type or None,
-        })
-
-    return JSONResponse(content=data)
-
+        return JSONResponse(
+            status_code=e.status_code,
+            content={
+                "ok": False,
+                "error": {"message": str(e.detail)},
+                "answer": answer_obj if answer_obj else "",
+                "sources": sources,
+            },
+        )
+    except Exception as e:
+        # Fallback: even if it crashes, ensure sources is defined
+        logging.exception("Unhandled error in /ask")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": {"message": f"Internal Server Error: {type(e).__name__}: {e}"},
+                "answer": "",
+                "sources": sources,
+            },
+        )
 
 @app.post("/v1/chat/completions/stream")
 async def chat_completions_stream(request: Request, x_api_key: Optional[str] = Header(default=None)):

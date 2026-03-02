@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Internal Assistant — Governance-First AI System</title>
+  <style>
+    :root{
+      --bg:#0b1220; --panel:#0f172a; --muted:#94a3b8; --text:#e5e7eb;
+      --card:#111c33; --border:rgba(148,163,184,0.18);
+      --btn:#2563eb; --btn2:#334155; --ok:#22c55e; --warn:#f59e0b;
+      --code:#0b1020;
+    }
+    *{box-sizing:border-box;font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}
+    body{margin:0;background:linear-gradient(180deg,#070b14 0%,#0b1220 100%);color:var(--text);}
+    a{color:#93c5fd;text-decoration:none}
+    .wrap{max-width:1100px;margin:0 auto;padding:28px 18px 42px;}
+    .hero{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px;}
+    .title{font-size:22px;font-weight:800;letter-spacing:0.2px;}
+    .sub{color:var(--muted);margin-top:6px;line-height:1.4}
+    .badges{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+    .badge{display:inline-flex;gap:8px;align-items:center;padding:6px 10px;border:1px solid var(--border);
+      background:rgba(17,28,51,0.6);border-radius:999px;color:#cbd5e1;font-size:13px}
+    .dot{width:8px;height:8px;border-radius:50%}
+    .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)}
+    .grid{display:grid;grid-template-columns: 1.15fr 0.85fr;gap:16px;align-items:start;}
+    @media (max-width: 980px){.grid{grid-template-columns:1fr}}
+    .panel{background:rgba(15,23,42,0.82);border:1px solid var(--border);border-radius:16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);overflow:hidden}
+    .panel-h{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+    .panel-h .h{font-weight:800}
+    .panel-b{padding:16px}
+    .muted{color:var(--muted)}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .input, .select, .num{
+      background:rgba(2,6,23,0.6);border:1px solid var(--border);color:var(--text);
+      border-radius:12px;padding:10px 12px;font-size:14px;outline:none;
+    }
+    textarea.input{width:100%;min-height:120px;resize:vertical;line-height:1.45}
+    .select{padding:10px 12px}
+    .num{width:92px}
+    .btn{background:var(--btn);border:none;color:white;padding:10px 14px;border-radius:12px;
+      font-weight:700;cursor:pointer}
+    .btn.secondary{background:var(--btn2)}
+    .btn.ghost{background:transparent;border:1px solid var(--border);color:#cbd5e1}
+    .btn:disabled{opacity:.6;cursor:not-allowed}
+    .try{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}
+    .try .btn{font-size:13px;padding:8px 10px}
+    .pill{font-size:12px;color:#cbd5e1;background:rgba(2,6,23,0.55);border:1px solid var(--border);
+      border-radius:999px;padding:6px 10px}
+    .card{background:rgba(17,28,51,0.65);border:1px solid var(--border);border-radius:14px;padding:12px 12px;margin-top:12px}
+    .card h4{margin:0 0 8px 0;font-size:14px}
+    .kvs{display:grid;grid-template-columns: 150px 1fr;gap:6px 10px;font-size:13px}
+    .kvs div:nth-child(odd){color:var(--muted)}
+    .list{margin:8px 0 0 18px;color:#e2e8f0}
+    .list li{margin:5px 0}
+    .callout{margin-top:12px;padding:10px 12px;border-radius:12px;border:1px solid var(--border);
+      background:rgba(2,6,23,0.45);color:#cbd5e1;font-size:13px;line-height:1.45}
+    details{margin-top:12px}
+    summary{cursor:pointer;color:#cbd5e1;font-weight:700}
+    pre{background:var(--code);border:1px solid var(--border);padding:12px;border-radius:12px;overflow:auto;color:#d1d5db}
+    .small{font-size:12px}
+    .okline{color:#86efac}
+    .warnline{color:#fbbf24}
+    .errline{color:#fca5a5}
+    .spacer{height:8px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="hero">
+      <div>
+        <!-- Landing area with more product-oriented language -->
+        <div class="title">🧩 Internal Assistant — Governance-First AI System</div>
+        <div class="sub">
+          A system-oriented assistant that delivers <b>source-backed answers</b>,
+          <b>action-ready runbooks</b>, and <b>auditable request traces</b>.
+          Designed for reliability, compliance, and operational clarity.
+        </div>
+        <div class="badges">
+          <div class="badge"><span class="dot ok"></span><b>Source-backed</b> <span class="muted">verify before acting</span></div>
+          <div class="badge"><span class="dot ok"></span><b>Action steps</b> <span class="muted">runbooks & checklists</span></div>
+          <div class="badge"><span class="dot ok"></span><b>Audit-ready</b> <span class="muted">request id + timings</span></div>
+          <div class="badge"><span class="dot warn"></span><b>Hybrid</b> <span class="muted">best default mode</span></div>
+        </div>
+      </div>
+      <div class="pill">
+        Endpoint: <a href="/docs" target="_blank">/docs</a> · Health: <a href="/health" target="_blank">/health</a>
+      </div>
+    </div>
+
+    <div class="grid">
+      <!-- Left: Playground (renamed to Demo Runner) -->
+      <div class="panel">
+        <div class="panel-h">
+          <div class="h">🎬 Demo Runner</div>
+          <div class="muted small" id="statusLine">Ready</div>
+        </div>
+        <div class="panel-b">
+          <div class="muted small">Pick a scenario below. This hosted demo runs in deterministic mode (LLM disabled) to showcase reliability, evidence, and auditability.</div>
+          <div class="spacer"></div>
+          <textarea id="q" class="input" placeholder="Scenario question will appear here" readonly></textarea>
+
+          <!-- Quick preset dropdown (now using scenario_id) -->
+          <div class="row" style="margin-top:10px">
+            <span class="muted small">Select scenario</span>
+            <select id="preset" class="select" style="flex:1;min-width:260px">
+              <option value="">— Choose a scenario —</option>
+              <option value="sev2_checklist">SEV-2 checklist (runbook)</option>
+              <option value="sev1_response">SEV-1 response (incident)</option>
+              <option value="escalation_policy">Escalation policy</option>
+              <option value="customer_outage_first">Customer outage scenario</option>
+              <option value="customer_update_template">Customer update draft</option>
+              <option value="audit_logging">Audit logging overview</option>
+              <option value="modes_guidance">Usage guidance</option>
+              <option value="architecture_overview">Architecture overview</option>
+              <option value="security_controls">Security controls</option>
+              <option value="product_overview">Product overview</option>
+            </select>
+            <button class="btn secondary" onclick="applyPreset()">Load</button>
+          </div>
+
+          <div class="spacer"></div>
+          <div class="row">
+            <label class="muted">k</label>
+            <input id="k" class="num" type="number" min="0" max="8" value="3" />
+            <label class="muted">mode</label>
+            <select id="mode" class="select">
+              <option value="hybrid" selected>Hybrid (recommended)</option>
+              <option value="kb">Verified (KB only)</option>
+              <option value="chat">Assist: In private deployment, LLM-backed rewriting is enabled; hosted demo focuses on governance-first behavior.</option>
+            </select>
+
+            <button id="askBtn" class="btn" onclick="runAsk()">Run scenario</button>
+            <button class="btn ghost" onclick="clearUI()">Clear</button>
+          </div>
+
+          <div class="try">
+            <button class="btn secondary" onclick="quickAskScenario('escalation_policy')">Escalation policy</button>
+            <button class="btn secondary" onclick="quickAskScenario('customer_outage_first')">Customer outage</button>
+            <button class="btn secondary" onclick="quickAskScenario('sev2_checklist')">SEV-2 checklist</button>
+            <button class="btn secondary" onclick="quickAskScenario('sev1_response')">Handle SEV-1</button>
+            <button class="btn secondary" onclick="quickAskScenario('customer_update_template')">Customer update</button>
+            <button class="btn secondary" onclick="quickAskScenario('audit_logging')">Audit logging</button>
+            <button class="btn secondary" onclick="quickAskScenario('modes_guidance')">Usage guidance</button>
+          </div>
+
+          <div id="friendlyHint" class="callout" style="display:none"></div>
+
+          <!-- Answer -->
+          <div id="answerCard" class="card" style="display:none">
+            <h4>🧠 Answer</h4>
+            <div id="answerBody" class="small"></div>
+          </div>
+
+          <!-- Sources -->
+          <div id="sourcesCard" class="card" style="display:none">
+            <h4>📚 Sources</h4>
+            <div id="sourcesBody" class="small"></div>
+          </div>
+
+          <!-- Request details -->
+          <details id="techBox" style="display:none">
+            <summary>🧾 Request details (click to expand)</summary>
+            <div class="spacer"></div>
+            <div id="techMeta" class="small"></div>
+            <div class="spacer"></div>
+            <button class="btn ghost" onclick="copyRaw()">Copy raw JSON</button>
+            <div class="spacer"></div>
+            <pre id="rawJson" class="small"></pre>
+          </details>
+
+          <!-- Error -->
+          <div id="errorBox" class="card" style="display:none">
+            <h4>❗ Error</h4>
+            <pre id="errorText" class="small errline"></pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: How to use -->
+      <div class="panel">
+        <div class="panel-h">
+          <div class="h">🧭 How to use</div>
+          <div class="pill">Quick guidance</div>
+        </div>
+        <div class="panel-b">
+          <div class="callout">
+            <b>Usage tips</b>
+            <ol class="list">
+              <li>Start with <b>SEV-2 checklist</b> to see an actionable, step-by-step response with sources.</li>
+              <li>Ask a general question in <b>Hybrid</b> mode to get the best balance of internal knowledge + explanation.</li>
+              <li>Open <b>Request details</b> to view an audit-friendly record (request id + timings).</li>
+            </ol>
+          </div>
+
+          <div class="card">
+            <h4>Modes (plain English)</h4>
+            <div class="kvs">
+              <div>Hybrid</div>
+              <div><b>Best for most questions.</b> Uses internal knowledge first; adds a clear explanation when needed.</div>
+
+              <div>Verified</div>
+              <div><b>Best for compliance.</b> Answers only when internal sources support the response.</div>
+
+              <div>Assist</div>
+              <div><b>Best for drafting.</b> More free-form help. (In this hosted demo, advanced LLM is limited; a GPU-backed version is available in private deployment.)</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h4>Business value</h4>
+            <!-- Enhanced Business value block -->
+            <ul class="list">
+              <li><b>Operational clarity</b> — structured steps reduce ambiguity during incidents.</li>
+              <li><b>Risk reduction</b> — answers are grounded in internal policies before action.</li>
+              <li><b>Governance-first design</b> — every request is traceable and reviewable.</li>
+            </ul>
+          </div>
+
+          <div class="card small muted">
+            This demo focuses on reliability and traceability. In a private environment, the same design supports a GPU-backed LLM for richer reasoning while keeping the same safety controls.
+          </div>
+          <!-- Project highlights card (interview-friendly) -->
+          <div class="card">
+            <h4>Project highlights</h4>
+            <ul class="list">
+              <li>Retrieval + verification architecture</li>
+              <li>Mode-based response strategy (Verified / Hybrid / Assist)</li>
+              <li>Structured runbook outputs</li>
+              <li>Audit-friendly logging (JSONL)</li>
+              <li>Tool routing for deterministic workflows</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<!-- 整段替换为新的 script (保持不变的结构，只替换内容) -->
+<script>
+  let DEMO_MAP = {};      // scenario_id -> {label, question}
+  let SELECTED_SCENARIO = "";
+  let LAST_RAW = "";
+
+  function setStatus(msg){ document.getElementById("statusLine").textContent = msg; }
+
+  function clearUI(){
+    document.getElementById("friendlyHint").style.display = "none";
+    document.getElementById("answerCard").style.display = "none";
+    document.getElementById("sourcesCard").style.display = "none";
+    document.getElementById("techBox").style.display = "none";
+    document.getElementById("errorBox").style.display = "none";
+    document.getElementById("answerBody").innerHTML = "";
+    document.getElementById("sourcesBody").innerHTML = "";
+    document.getElementById("techMeta").innerHTML = "";
+    document.getElementById("rawJson").textContent = "";
+    document.getElementById("errorText").textContent = "";
+    LAST_RAW = "";
+    setStatus("Ready");
+  }
+
+  function esc(s){
+    return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+  }
+
+  async function loadDemoScenarios(){
+    try{
+      const r = await fetch("/demo");
+      const j = await r.json();
+      (j.scenarios || []).forEach(s => { DEMO_MAP[s.id] = s; });
+    }catch(e){
+      // ignore
+    }
+  }
+  loadDemoScenarios();
+
+  function quickAskScenario(sid){
+    SELECTED_SCENARIO = sid;
+    const item = DEMO_MAP[sid];
+    const q = (item && item.question) ? item.question : `Scenario: ${sid}`;
+    document.getElementById("q").value = q;
+    runAsk();
+  }
+
+  function applyPreset(){
+    const sid = document.getElementById("preset").value;
+    if (!sid) return;
+    SELECTED_SCENARIO = sid;
+
+    const item = DEMO_MAP[sid];
+    document.getElementById("q").value = (item && item.question) ? item.question : `Scenario: ${sid}`;
+  }
+
+  function confLabel(x){
+    if (typeof x !== "number") return null;
+    if (x >= 0.8) return "High";
+    if (x >= 0.55) return "Medium";
+    return "Low";
+  }
+
+  function renderAnswer(data){
+    const ans = data.answer;
+    const meta = data.meta || {};
+    const engine = (meta.engine || "").toLowerCase();
+
+    const hint = (engine === "tool" || engine === "kb")
+      ? "✅ Source-backed result — grounded in internal policies and runbooks."
+      : "✨ Best-effort explanation: combines internal context (when available) with a clear summary.";
+
+    const hintBox = document.getElementById("friendlyHint");
+    hintBox.innerHTML = esc(hint);
+    hintBox.style.display = "block";
+
+    let html = "";
+    if (typeof ans === "string") {
+      html += `<div>${esc(ans)}</div>`;
+    } else if (ans && typeof ans === "object") {
+      if (ans.summary) html += `<div><b>${esc(ans.summary)}</b></div>`;
+      if (Array.isArray(ans.steps) && ans.steps.length){
+        html += `<div class="spacer"></div><div class="muted">Steps</div><ol class="list">` +
+          ans.steps.map(x=>`<li>${esc(x)}</li>`).join("") + `</ol>`;
+      }
+      if (Array.isArray(ans.notes) && ans.notes.length){
+        html += `<div class="spacer"></div><div class="muted">Notes</div><ul class="list">` +
+          ans.notes.map(x=>`<li>${esc(x)}</li>`).join("") + `</ul>`;
+      }
+      const cl = confLabel(ans.confidence);
+      if (cl){
+        html += `<div class="spacer"></div><div class="muted">Confidence</div><div>${esc(cl)}</div>`;
+      }
+    } else {
+      html += `<div class="muted">No answer payload.</div>`;
+    }
+
+    document.getElementById("answerBody").innerHTML = html;
+    document.getElementById("answerCard").style.display = "block";
+  }
+
+  function renderSources(data){
+    const sources = data.sources || [];
+    if (!sources.length){
+      document.getElementById("sourcesCard").style.display = "none";
+      return;
+    }
+    const html = sources.slice(0,3).map(s=>{
+      const title = s.title ? ` — <span class="muted">${esc(s.title)}</span>` : "";
+      const preview = s.preview ? esc(s.preview) : "";
+      return `<div class="card" style="margin-top:10px">
+        <div><b>${esc(s.source || "source")}</b>${title}</div>
+        <div class="muted small" style="margin-top:6px;white-space:pre-wrap">${preview}</div>
+      </div>`;
+    }).join("");
+    document.getElementById("sourcesBody").innerHTML = html;
+    document.getElementById("sourcesCard").style.display = "block";
+  }
+
+  function renderTech(data){
+    const meta = data.meta || {};
+    const t = data.timings_ms || {};
+    const tool = data.tool || {};
+    const engine = meta.engine || "";
+    const model = meta.model || "—";
+    const rid = data.request_id || "—";
+
+    const metaHtml = `
+      <div class="kvs">
+        <div>request_id</div><div>${esc(rid)}</div>
+        <div>engine</div><div>${esc(engine)}</div>
+        <div>model</div><div>${esc(String(model))}</div>
+        <div>timings</div><div>${esc(JSON.stringify(t))}</div>
+        <div>tool</div><div>${esc(tool.used || "—")}</div>
+      </div>
+    `;
+    document.getElementById("techMeta").innerHTML = metaHtml;
+
+    LAST_RAW = JSON.stringify(data, null, 2);
+    document.getElementById("rawJson").textContent = LAST_RAW;
+    document.getElementById("techBox").style.display = "block";
+  }
+
+  async function copyRaw(){
+    if (!LAST_RAW) return;
+    try{
+      await navigator.clipboard.writeText(LAST_RAW);
+      setStatus("Copied raw JSON ✅");
+      setTimeout(()=>setStatus("Ready"), 1200);
+    }catch(e){
+      setStatus("Copy failed");
+    }
+  }
+
+  // ✅ 关键：永远构造一个非空字符串 question
+  function buildQuestionFromScenario(scenarioId){
+    const item = DEMO_MAP[scenarioId];
+    if (item && typeof item.question === "string" && item.question.trim()) return item.question.trim();
+    return `Scenario: ${scenarioId}`; // fallback 永远非空
+  }
+
+  async function runAsk(){
+    // scenario id 优先级：你点的快捷按钮 > 下拉框
+    const scenarioId = (SELECTED_SCENARIO || document.getElementById("preset").value || "").trim();
+
+    if (!scenarioId){
+      document.getElementById("errorBox").style.display = "block";
+      document.getElementById("errorText").textContent = "Please select a demo scenario.";
+      return;
+    }
+
+    // q 优先来自 textarea；如果没有，就用 scenarioId 自动生成
+    const qEl = document.getElementById("q");
+    let q = (qEl && typeof qEl.value === "string") ? qEl.value.trim() : "";
+
+    if (!q){
+      q = buildQuestionFromScenario(scenarioId);
+      if (qEl) qEl.value = q; // 回填到 UI，避免“看起来空但其实发了”
+    }
+
+    // k / mode
+    const k = Number(document.getElementById("k").value || 3);
+    const mode = document.getElementById("mode").value;
+
+    clearUI();
+
+    const askBtn = document.getElementById("askBtn");
+    askBtn.disabled = true;
+    setStatus("Running scenario…");
+
+    try{
+      const headers = {"Content-Type":"application/json"};
+
+      // 本地 dev key（如果你启用了 AUTH）
+      try{
+        const host = (location && location.hostname) ? location.hostname : "";
+        if (host === "127.0.0.1" || host === "localhost"){
+          headers["x-api-key"] = "dev-user-key";
+        }
+      }catch(e){}
+
+      // ✅ 用绝对 URL，避免 origin 乱掉
+      const url = new URL("/ask", location.origin);
+
+      // ✅ 最重要：question 一定是字符串且非空
+      const payload = {
+        question: String(q),
+        // 下面这些字段如果后端不需要可以删掉，但保留也没问题（取决于你后端是否 forbid extra）
+        scenario_id: scenarioId,
+        k: k,
+        mode: mode
+      };
+
+      console.log("sending payload:", payload);
+
+      const res = await fetch(url.toString(), {
+        method:"POST",
+        headers,
+        body: JSON.stringify(payload)
+      });
+
+      const text = await res.text();
+      let data = null;
+      try{ data = JSON.parse(text); }catch(_){}
+
+      if (!res.ok){
+        const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : text;
+        throw new Error(msg || `Request failed (${res.status})`);
+      }
+      if (!data) throw new Error("Server returned non-JSON response.");
+
+      renderAnswer(data);
+      renderSources(data);
+      renderTech(data);
+
+      const eng = (data.meta && data.meta.engine) ? data.meta.engine : "ok";
+      setStatus(`Done · engine=${eng}`);
+    }catch(err){
+      document.getElementById("errorBox").style.display = "block";
+      document.getElementById("errorText").textContent = String(err && err.message ? err.message : err);
+      setStatus("Error");
+    }finally{
+      askBtn.disabled = false;
+    }
+  }
+</script>
+</body>
+</html>
