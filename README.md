@@ -1,4 +1,4 @@
-# Internal LLM Gateway  
+# Internal LLM Gateway
 ### Enterprise-Style Tool-First RAG System with Secure Access, Audit Logging & Deterministic Business Tools
 
 An internal-facing LLM Gateway that wraps a raw LLM backend (vLLM) with:
@@ -14,11 +14,63 @@ An internal-facing LLM Gateway that wraps a raw LLM backend (vLLM) with:
 
 ---
 
+# Live Demo (Render Deployment)
+
+You can try the live instance hosted on Render:
+
+https://llm-internal-assistant.onrender.com/
+
+---
+
+## Quick Start (60 seconds)
+
+1) Verify service health:
+
+```bash
+curl https://llm-internal-assistant.onrender.com/health
+```
+
+Expected:
+
+```json
+{"status":"ok"}
+```
+
+2) Try a deterministic tool query:
+
+```bash
+curl -X POST https://llm-internal-assistant.onrender.com/ask \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: dev-user-key" \
+  -d '{"question":"List open Sev-2 incidents","k":3}'
+```
+
+3) Open the Web UI in browser:
+
+https://llm-internal-assistant.onrender.com/
+
+---
+
+## Demo API Keys
+
+| Role  | API Key        |
+|-------|----------------|
+| User  | dev-user-key   |
+| Admin | dev-admin-key  |
+
+Include API key in requests:
+
+```bash
+-H "x-api-key: dev-user-key"
+```
+
+---
+
 # Why This Project Matters
 
 Most LLM demos look like this:
 
-User → Model → Text Output
+User → Model → Text Output  
 
 Real production systems look like this:
 
@@ -28,7 +80,7 @@ Gateway (Auth + Policy + Tools + RAG + Audit)
 ↓  
 LLM Backend  
 
-This repository implements the gateway layer.
+This repository implements the **gateway layer** — the part real companies actually build.
 
 ---
 
@@ -40,7 +92,7 @@ Operational queries are routed to deterministic tools before calling the LLM.
 
 Example:
 
-- "List open Sev-2 incidents" → incident.list_open tool
+- "List open Sev-2 incidents" → `incident.list_open`
 - No LLM call
 - No token usage
 - Fully deterministic output
@@ -48,23 +100,30 @@ Example:
 
 If the LLM backend is offline:
 
-```
+```bash
 docker compose stop vllm
 ```
 
 Tool-based queries continue to function.
 
 This mirrors real production priorities:
-- reliability
-- cost control
-- deterministic workflows
 
-Execution modes (auto-selected via routing rules):
+- reliability  
+- cost control  
+- deterministic workflows  
 
-- tool        → deterministic business logic only  
-- tool+llm    → tool output enriched with model reasoning  
-- rag+llm     → retrieval grounding + model generation  
-- llm         → direct model invocation  
+---
+
+### Execution Modes
+
+The gateway dynamically selects execution mode **before token generation**:
+
+- `tool` → deterministic business logic only
+- `tool+llm` → tool output enriched with model reasoning
+- `rag+llm` → retrieval grounding + model generation
+- `llm` → direct model invocation
+
+Mode selection is handled via routing rules.
 
 ---
 
@@ -80,27 +139,32 @@ For knowledge questions, the gateway:
 
 Answers are grounded in internal documentation, reducing hallucination risk.
 
+Embeddings can be disabled in CI:
+
+```bash
+DISABLE_EMBEDDINGS=1
+```
+
 ---
 
 ## 3) Enterprise Citation Cards
 
 Responses return structured citation metadata:
 
-```
+```json
 {
-"sources": [
-{
-"title": "Incident Response",
-"doc_type": "Runbook",
-"section": "# Severity Levels",
-"score": 1.0,
-"preview": "...",
-"rank": 1
-}
-]
+  "sources": [
+    {
+      "title": "Incident Response",
+      "doc_type": "Runbook",
+      "section": "# Severity Levels",
+      "score": 1.0,
+      "preview": "...",
+      "rank": 1
+    }
+  ]
 }
 ```
-
 
 Tool-mode citations are intelligently distributed across multiple documents to maximize policy coverage.
 
@@ -112,8 +176,8 @@ All endpoints require API keys.
 
 Roles:
 
-- user → /ask
-- admin → /reload_kb, /kb_status
+- `user` → `/ask`
+- `admin` → `/reload_kb`, `/kb_status`
 
 Unauthorized access returns structured 403 responses.
 
@@ -128,7 +192,7 @@ Each request logs:
 - role
 - latency
 - tool usage
-- prompt hash (not raw prompt)
+- prompt hash (not raw prompt text)
 
 No sensitive text is stored.
 
@@ -137,7 +201,6 @@ Audit logs:
 ```
 gateway/artifacts/audit/audit.jsonl
 ```
-
 
 This mirrors internal AI governance requirements.
 
@@ -157,6 +220,44 @@ Endpoint:
 GET /metrics
 ```
 
+---
+
+# Response Contract (Structured JSON Envelope)
+
+All responses follow a structured contract:
+
+```json
+{
+  "status": "ok",
+  "request_id": "uuid",
+  "answer": {
+    "summary": "...",
+    "steps": [],
+    "notes": [],
+    "confidence": 0.95
+  },
+  "sources": [],
+  "tool": {
+    "used": "incident.list_open",
+    "result": {}
+  },
+  "meta": {
+    "mode": "tool",
+    "engine": "gateway"
+  },
+  "timings_ms": {
+    "llm": 0,
+    "total": 5
+  }
+}
+```
+
+This ensures:
+
+- deterministic structure
+- API contract stability
+- UI compatibility
+- auditability
 
 ---
 
@@ -178,134 +279,35 @@ vLLM (OpenAI-compatible backend)
 
 ---
 
-# Repository Structure
-
-```
-llm-internal-assistant/
-│
-├── gateway/
-│ ├── src/app.py
-│ ├── src/tools/
-│ ├── kb/
-│ ├── tests/
-│ ├── requirements.txt
-│ └── Dockerfile
-│
-├── configs/
-│ └── server.example.yaml
-│
-├── docker-compose.yml
-├── pytest.ini
-└── .github/workflows/ci.yml
-```
-
----
-
-# Running the System
+# Running Locally
 
 Start services:
-```
+
+```bash
 docker compose up -d --build
 ```
 
 Health check:
 
-```
+```bash
 curl http://127.0.0.1:8000/health
 ```
 
 ---
 
-# Demo Scenarios
-
-## 1) Deterministic Tool Query (LLM Not Required)
-
-Stop the LLM backend (vLLM):
-
-```
-docker compose stop vllm
-```
-Send a tool-routed request (gateway will NOT call the LLM):
-
-```
-Invoke-RestMethod -Uri "http://127.0.0.1:8000/ask" -Method POST `
-  -Headers @{"x-api-key"="dev-user-key"} `
-  -ContentType "application/json" `
-  -Body '{"question":"List open Sev-2 incidents","k":3}' |
-  ConvertTo-Json -Depth 8
-```
-Expected:
-
-meta.engine = tool
-
-timings_ms.llm = 0
-
-sources contains evidence cards even with vLLM offline
-
----
-
-## 2) Tool + Policy Evidence
-
-Query:
-
-"Show me the SEV-2 checklist"
-
-Returns:
-
-- deterministic checklist steps
-- distributed citation cards across multiple documents
-
----
-
-## 3) RAG + LLM Knowledge Query
-
-```
-docker compose start vllm
-```
-
-Query:
-
-"Why do we use embeddings?"
-
-Returns:
-
-- grounded citations
-- RAG context injection
-- structured JSON answer
-
----
-
 # CI-Safe Testing
 
-- No GPU required
-- vLLM calls stubbed
-- Embeddings disabled in CI
-- Deterministic vector fallback
+No GPU required.
 
 Run locally:
 
-```
+```bash
 export PYTHONPATH=gateway
 export DISABLE_EMBEDDINGS=1
 pytest -q
 ```
 
 ---
-
-# What This Demonstrates
-
-This project demonstrates:
-
-- production-style LLM wrapping
-- secure gateway design
-- deterministic tool routing
-- grounded RAG systems
-- structured response contracts
-- observability and audit logging
-- CI-safe AI engineering patterns
-
-The system remains functional even if the LLM backend is unavailable.
-
 
 # Design Tradeoffs
 
@@ -316,12 +318,10 @@ Key decisions:
 - Operational workflows must remain functional even if the LLM backend is offline
 - Business-critical queries should not depend on token generation
 - Deterministic tools reduce latency and cost
-- RAG is only invoked when semantic reasoning is required
+- RAG is invoked only when semantic reasoning is required
 
-Embeddings are lazily loaded and can be disabled in CI:
+Embeddings are lazily loaded and can be disabled in CI to ensure:
 
-- avoids external downloads
-- ensures deterministic test behavior
-- stabilizes automated pipelines
-
-These constraints reflect real production AI platform engineering tradeoffs.
+- no external downloads
+- deterministic test behavior
+- stable automated pipelines
