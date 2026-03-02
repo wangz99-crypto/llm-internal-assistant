@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-from gateway.src.tools.router import route_tool
+from src.tools.router import route_tool
 from gateway.src.tools.incident_tool import list_open_incidents
 from gateway.src.tools.runbook_tool import get_sev_checklist
 from gateway.src.ui.demo_page import mount_demo_ui
