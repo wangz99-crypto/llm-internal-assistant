@@ -1,39 +1,8 @@
-# Audit and Access Controls
+## Quick Answer (Audit Logging & Access)
 
-## Purpose
-Ensure all assistant responses can be reviewed, traced, and verified when necessary.
-
----
-
-## What Is Logged
-
-- Request ID
-- Timestamp
-- User role
-- Mode used (Hybrid / Verified / Assist)
-- Response latency
-- Sources referenced (if any)
-
----
-
-## Why This Matters
-
-- Supports compliance reviews
-- Enables incident retrospectives
-- Improves governance
-- Prevents unauthorized access
-
----
-
-## Access Control Principles
-
-- Role-based permissions
-- Rate limits per user role
-- Maximum input size controls
-- Optional strict verification mode
-
----
-
-## Business Value
-
-Traceability reduces operational risk and increases executive confidence in AI-assisted workflows.
+1. Log request_id, timestamp, user_id/role, mode, status, and latency.
+2. Do NOT log raw prompts; store only prompt hash/fingerprint where applicable.
+3. Record which KB sources were referenced (file + section) for traceability.
+4. Restrict access using role-based permissions; admin-only for sensitive endpoints.
+5. Use logs for compliance reviews, incident retrospectives, and governance reporting.
+6. Treat audit logs as security data; rotate keys and limit admin access.

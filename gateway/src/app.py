@@ -454,66 +454,76 @@ DEMO_COOKIE_NAME = "demo_key"
 DEMO_SCRIPT_ENABLED = os.getenv("DEMO_SCRIPT", "1") == "1"  # default ON in demo
 
 DEMO_SCENARIOS_OLD = {
+
     # TOOL-FIRST (always stable)
     "sev2_checklist": {
         "label": "Runbook: SEV-2 checklist (tool)",
-        "canonical_question": "Show me the SEV-2 checklist",
+        "canonical_question": "Provide the SEV-2 incident stabilization checklist.",
         "force_engine": "tool",
         "force_tool": ("runbook.get_checklist", {"sev": 2}),
     },
 
     # KB-LOCKED (always hit the correct doc)
+
     "escalation_policy": {
         "label": "Policy: Escalation policy (KB)",
-        "canonical_question": "Summarize the escalation policy in 5 bullets.",
+        "canonical_question": "What is our escalation policy during incidents? Summarize in 5 bullets.",
         "force_engine": "kb_demo",
         "force_file": "escalation_policy.md",
     },
+
     "audit_logging": {
         "label": "Governance: What gets logged for audit and why? (KB)",
-        "canonical_question": "What gets logged for audit and why?",
+        "canonical_question": "What events are logged for audit purposes and why are they important?",
         "force_engine": "kb_demo",
         "force_file": "audit_and_access.md",
     },
+
     "sev1_response": {
         "label": "Incident: Handle SEV-1 (KB)",
-        "canonical_question": "How should I handle a Sev-1 incident?",
+        "canonical_question": "A SEV-1 outage has been declared. What actions should the response team take immediately?",
         "force_engine": "kb_demo",
         "force_file": "incident_playbook_sev1.md",
     },
+
     "customer_outage_first": {
         "label": "Ops: Customer outage—what should I do first? (KB)",
-        "canonical_question": "I have a service outage affecting customers. What should I do first?",
+        "canonical_question": "We have a customer-facing outage. What should I do in the first 5 minutes?",
         "force_engine": "kb_demo",
         "force_file": "incident_response.md",
     },
+
     "customer_update_template": {
         "label": "Comms: Draft customer update (KB template)",
-        "canonical_question": "Draft a customer update for a service disruption.",
+        "canonical_question": "Draft a customer status update for an ongoing service disruption.",
         "force_engine": "kb_demo",
         "force_file": "incident_comms_templates.md",
     },
+
     "modes_guidance": {
         "label": "Usage: When should I use Verified vs Hybrid? (KB)",
-        "canonical_question": "When should I use Verified vs Hybrid?",
+        "canonical_question": "When should I use Verified mode versus Hybrid mode in this system?",
         "force_engine": "kb_demo",
         "force_file": "knowledge_usage_guidelines.md",
     },
+
     "architecture_overview": {
         "label": "System: Architecture overview (KB)",
-        "canonical_question": "Explain the gateway architecture and request flow in 6 bullets.",
+        "canonical_question": "Explain the internal assistant architecture and request flow in 6 bullets.",
         "force_engine": "kb_demo",
         "force_file": "architecture_overview.md",
     },
+
     "security_controls": {
         "label": "Security: Key controls (KB)",
-        "canonical_question": "Summarize the security controls in 6 bullets.",
+        "canonical_question": "What security controls are implemented in the gateway system?",
         "force_engine": "kb_demo",
         "force_file": "security_controls.md",
     },
+
     "product_overview": {
         "label": "Product: What is this system? (KB)",
-        "canonical_question": "Give a concise product overview and the main guarantees.",
+        "canonical_question": "What is this internal assistant designed for and what guarantees does it provide?",
         "force_engine": "kb_demo",
         "force_file": "product_overview.md",
     },

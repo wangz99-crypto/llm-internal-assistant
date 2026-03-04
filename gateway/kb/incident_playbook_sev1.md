@@ -1,47 +1,8 @@
-# SEV-1 Incident Playbook
+## Quick Answer (SEV-1 Immediate Actions)
 
-## When to Use
-Use this checklist when the service is unavailable or customer operations are significantly impacted.
-
----
-
-## Immediate Actions (First 15 Minutes)
-
-1. Confirm the impact scope.
-2. Assign an incident commander.
-3. Stabilize core service (rollback, restart, failover).
-4. Post initial internal update.
-5. Open incident tracking record.
-
----
-
-## Customer Communication
-
-- Acknowledge the issue quickly.
-- Avoid speculation.
-- Provide next update time.
-- Keep messaging consistent.
-
----
-
-## Stabilization Phase
-
-1. Identify root cause.
-2. Deploy fix or mitigation.
-3. Monitor key metrics.
-4. Confirm service restoration.
-
----
-
-## After Resolution
-
-- Document timeline.
-- Identify contributing factors.
-- Schedule post-incident review.
-- Define preventive improvements.
-
----
-
-## Business Outcome
-
-Following this playbook reduces downtime, improves customer confidence, and ensures leadership visibility.
+1. Declare SEV-1 and assign Incident Commander (IC) + Comms + Scribe roles.
+2. Confirm scope: affected services, regions, and customer impact.
+3. Stabilize fast: rollback, restart, failover, or traffic shed.
+4. Post initial internal update with impact + mitigation in progress.
+5. Start incident tracking record and maintain a timeline of actions.
+6. Prepare a customer update with “what happened / impact / next update time”.

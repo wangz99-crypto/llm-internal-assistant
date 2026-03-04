@@ -1,45 +1,7 @@
-# Incident Communication Templates
+## Quick Answer (Customer Update Checklist)
 
-## Customer Update Template
-
-Subject: Service Disruption Update
-
-We are currently investigating an issue affecting [service name].  
-Our team is actively working to restore normal operations.
-
-Current status:
-- Impact: [brief description]
-- Next update: [time]
-
-We apologize for the inconvenience and will continue to provide updates.
-
----
-
-## Internal Leadership Update
-
-Incident Summary:
-- Severity: SEV-1 / SEV-2
-- Impact scope:
-- Estimated business impact:
-
-Mitigation progress:
-- Actions taken:
-- Next milestone:
-
----
-
-## Post-Incident Summary Template
-
-Incident Title:
-Timeline:
-Root Cause:
-Resolution:
-Prevention Plan:
-
----
-
-## Why Structured Communication Matters
-
-- Maintains trust
-- Reduces misinformation
-- Ensures alignment across teams
+1. State the incident and current customer impact in one sentence.
+2. List affected services/features and scope (who is impacted).
+3. State what the team is doing now (mitigation in progress).
+4. Provide the next update time (commit to a cadence).
+5. Include support/contact channel and keep wording consistent (no speculation).
