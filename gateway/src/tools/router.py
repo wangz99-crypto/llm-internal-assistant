@@ -25,3 +25,20 @@ def route_tool(question: str) -> Optional[Tuple[str, dict]]:
             return ("incident.list_open", {"limit": 10})
 
     return None
+
+
+# Semantic intent descriptions for embedding-based fallback routing.
+# Used by _semantic_route_tool() in app.py when keyword routing returns None.
+# Intentionally kept as pure data here — no model dependency in this file.
+INTENT_DESCRIPTIONS: dict[str, list[str]] = {
+    "runbook.get_checklist": [
+        "show me the SEV-2 runbook checklist",
+        "what are the steps for a SEV-2 incident",
+        "get the sev2 playbook or response steps",
+    ],
+    "incident.list_open": [
+        "list all currently open incidents",
+        "show me active incidents right now",
+        "which incidents are open or ongoing",
+    ],
+}

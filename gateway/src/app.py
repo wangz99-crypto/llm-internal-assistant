@@ -137,6 +137,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 KB_DIR = BASE_DIR / "kb"
 KB_CHUNKS: list[dict] = []
 KB_EMB: np.ndarray | None = None
+TOOL_INTENT_EMB: dict[str, np.ndarray] = {}   # tool_name -> (n_phrases, dim) intent matrix
+SEMANTIC_TOOL_THRESHOLD = 0.60                 # min cosine similarity to trigger semantic routing
+_DEFINITIONAL_RE = re.compile(                 # blocks definitional openers from semantic routing
+    r"^\s*(what\s+is|what's|define|explain)\b", re.I
+)
+DEMO_UI = os.getenv("DEMO_UI", "0") == "1"    # expose routing debug panel in UI responses
 
 
 # Move _ws definition BEFORE any function that uses it (clean_preview)
@@ -291,6 +297,8 @@ def extract_section_for_chunk(full_text: str, chunk_start: int) -> str | None:
 def clean_preview(text: str, limit: int = 240) -> str:
     text = _ws.sub(" ", text).strip()
     return text[:limit]
+
+RETRIEVAL_SCORE_THRESHOLD = 0.20  # minimum cosine similarity to include a chunk in LLM context
 
 def cosine_topk_with_scores(query_vec: np.ndarray, mat: np.ndarray, k: int = 3) -> list[tuple[int, float]]:
     """Return top-k (chunk_index, cosine_similarity)."""
@@ -788,6 +796,21 @@ async def build_kb_index() -> None:
             None if KB_EMB is None else KB_EMB.shape,
         )
 
+    # Precompute intent embeddings for semantic tool routing.
+    # Runs after the KB block so both share the same startup lifecycle.
+    # If this fails, log and continue — keyword-only routing remains fully functional.
+    global TOOL_INTENT_EMB
+    try:
+        from src.tools.router import INTENT_DESCRIPTIONS
+        new_intent_emb = {}
+        for tool_name, phrases in INTENT_DESCRIPTIONS.items():
+            new_intent_emb[tool_name] = await embed_texts(phrases)
+        TOOL_INTENT_EMB = new_intent_emb
+        logger.info("Tool intent embeddings ready: %d tools", len(TOOL_INTENT_EMB))
+    except Exception as e:
+        TOOL_INTENT_EMB = {}
+        logger.warning("Tool intent embedding precomputation failed (keyword routing only): %s", e)
+
 
 # ----------------------------
 # privacy-preserving hash
@@ -880,7 +903,7 @@ if allowed:
 @app.get("/health")
 def health():
     """Health check endpoint required by tests."""
-    return {"status": "ok"}
+    return {"status": "ok", "service": "llm-gateway-demo"}
 
 
 # =========================
@@ -972,6 +995,34 @@ async def reload_kb(x_api_key: Optional[str] = Header(default=None), request: Re
 def _now_ms() -> int:
     # monotonic, higher precision than time.time()
     return int(time.perf_counter() * 1000)
+
+
+async def _semantic_route_tool(question: str) -> Optional[tuple[str, dict]]:
+    """
+    Embedding-based tool routing fallback.
+    Only called when keyword routing returns None.
+    Returns None if embeddings are unavailable, disabled, or no intent clears the threshold.
+    """
+    if not TOOL_INTENT_EMB:
+        return None
+    if os.getenv("DISABLE_EMBEDDINGS", "0") == "1":
+        return None
+    if _DEFINITIONAL_RE.match(question or ""):
+        return None
+    q_emb = await embed_texts([question])
+    best_tool, best_score = None, 0.0
+    for tool_name, intent_mat in TOOL_INTENT_EMB.items():
+        hits = cosine_topk_with_scores(q_emb[0], intent_mat, k=1)
+        if hits and hits[0][1] > best_score:
+            best_score = hits[0][1]
+            best_tool = tool_name
+    if best_score < SEMANTIC_TOOL_THRESHOLD:
+        return None
+    if best_tool == "runbook.get_checklist":
+        return ("runbook.get_checklist", {"sev": 2})
+    if best_tool == "incident.list_open":
+        return ("incident.list_open", {"limit": 10})
+    return None
 
 def strip_fenced_json(text: str) -> str:
     """
@@ -1078,6 +1129,8 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
     debug: Dict[str, Any] = {}
     request_id = str(uuid.uuid4())
     t0 = _now_ms()
+    _routing_source: str = "rag"   # keyword | semantic | rag | fallback
+    _llm_used: bool = False
     
     # --- FIX: ensure audit timers always exist even for early-return paths ---
     t_aud0 = t0
@@ -1405,6 +1458,12 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         # =========================
         # Your original logic: route_tool(question) -> ("runbook.get_checklist", {"sev": 2})
         tool_route = route_tool(question)
+        if tool_route is not None:
+            _routing_source = "keyword"
+        else:
+            tool_route = await _semantic_route_tool(question)
+            if tool_route is not None:
+                _routing_source = "semantic"
         if tool_route:
             tool_name, tool_args = tool_route
 
@@ -1623,6 +1682,11 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
                         "tool_name": tool_name,
                         "tool_args": tool_args,
                     })
+
+                if DEMO_UI:
+                    resp["debug"]["routing"] = _routing_source
+                    resp["debug"]["tool_used"] = tool_name
+                    resp["debug"]["llm_used"] = _llm_used
 
                 return JSONResponse(status_code=200, content=resp)
 
@@ -1889,7 +1953,7 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
 
                     # Use the enterprise-style template answer generator
                     answer_obj = demo_template_answer(question, steps, sources)
-                    warnings = ["DEMO_MODE=1: LLM disabled; deterministic KB retrieval used"]
+                    warnings.append("DEMO_MODE=1: LLM disabled; deterministic KB retrieval used")
                     status_out = "ok"
                 else:
                     # Optimized no-match prompt
@@ -1905,7 +1969,7 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
                         "confidence": 0.4,
                     }
                     status_out = "ok"
-                    warnings = []
+                    # preserve any warnings accumulated earlier (e.g. threshold warning)
 
                 async with KB_LOCK:
                     kb_files = len({c["source"] for c in KB_CHUNKS})
@@ -1927,6 +1991,10 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
                 )
                 resp["warnings"] = warnings
                 resp["debug"] = {"prompt_hash": q_hash, "rag_enabled": True}
+                if DEMO_UI:
+                    resp["debug"]["routing"] = _routing_source
+                    resp["debug"]["tool_used"] = tool_name
+                    resp["debug"]["llm_used"] = _llm_used
 
                 return JSONResponse(status_code=200, content=resp)
 
@@ -1946,6 +2014,11 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
         if has_kb:
             async with KB_LOCK:
                 hits = cosine_topk_with_scores(q_emb[0], KB_EMB, k=k)
+                hits = [(i, s) for (i, s) in hits if s >= RETRIEVAL_SCORE_THRESHOLD]
+                if not hits:
+                    warnings.append(
+                        "No KB sources met the relevance threshold. Answer may be ungrounded."
+                    )
                 ctx_parts = []
                 for rank, (i, score) in enumerate(hits, start=1):
                     chunk = KB_CHUNKS[i]
@@ -2022,6 +2095,7 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
                 r.raise_for_status()
                 out = r.json()
             t_llm1 = _now_ms()
+            _llm_used = True
 
             # Test requirement: parse JSON from choices[0].message.content
             raw_answer = out["choices"][0]["message"]["content"]
@@ -2029,6 +2103,7 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
 
         except httpx.RequestError as e:
             # vLLM unavailable: don't return 500, fallback to deterministic KB (keyword) answer
+            _routing_source = "fallback"
             warnings.append(f"LLM backend unavailable, falling back to KB only. ({type(e).__name__})")
 
             async with KB_LOCK:
@@ -2068,29 +2143,33 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
 
             # Return directly with 200 (don't continue further)
             t1 = _now_ms()
-            return JSONResponse(
-                status_code=200,
-                content=make_ok_envelope(
-                    request_id=request_id,
-                    answer=answer_obj,
-                    sources=sources,
-                    tool={"used": tool_name, "result": None},
-                    meta={
-                        "k": k,
-                        "mode": "kb_fallback",
-                        "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
-                        "model": None,
-                        "engine": "kb_fallback",
-                    },
-                    timings_ms={
-                        "embed": 0,
-                        "retrieve": 0,
-                        "llm": max(0, t_llm1 - t_llm0),
-                        "audit": 0,
-                        "total": (t1 - t0),
-                    },
-                ),
+            _fb_resp = make_ok_envelope(
+                request_id=request_id,
+                answer=answer_obj,
+                sources=sources,
+                tool={"used": tool_name, "result": None},
+                meta={
+                    "k": k,
+                    "mode": "kb_fallback",
+                    "kb": {"dir": str(display_source(str(KB_DIR))), "files": kb_files, "chunks": kb_chunks},
+                    "model": None,
+                    "engine": "kb_fallback",
+                },
+                timings_ms={
+                    "embed": 0,
+                    "retrieve": 0,
+                    "llm": max(0, t_llm1 - t_llm0),
+                    "audit": 0,
+                    "total": (t1 - t0),
+                },
             )
+            _fb_resp["warnings"] = warnings
+            _fb_resp["debug"] = {"prompt_hash": q_hash, "rag_enabled": bool(has_kb)}
+            if DEMO_UI:
+                _fb_resp["debug"]["routing"] = _routing_source
+                _fb_resp["debug"]["tool_used"] = tool_name
+                _fb_resp["debug"]["llm_used"] = _llm_used
+            return JSONResponse(status_code=200, content=_fb_resp)
 
         if mode == "hybrid" and not sources:
             # Make it explicit when we answered without internal citations.
@@ -2168,6 +2247,11 @@ async def ask(request: Request, x_api_key: Optional[str] = Header(default=None))
                 "tool_name": tool_name,
                 "tool_args": tool_args,
             })
+
+        if DEMO_UI:
+            resp["debug"]["routing"] = _routing_source
+            resp["debug"]["tool_used"] = tool_name
+            resp["debug"]["llm_used"] = _llm_used
 
         return JSONResponse(status_code=200, content=resp)
 

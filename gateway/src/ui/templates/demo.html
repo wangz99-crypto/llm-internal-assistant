@@ -71,11 +71,10 @@
     <div class="hero">
       <div>
         <!-- Landing area with more product-oriented language -->
-        <div class="title">🧩 Internal Assistant — Governance-First AI System</div>
+        <div class="title">Internal Assistant</div>
         <div class="sub">
-          A system-oriented assistant that delivers <b>source-backed answers</b>,
-          <b>action-ready runbooks</b>, and <b>auditable request traces</b>.
-          Designed for reliability, compliance, and operational clarity.
+          Ask about incidents, runbooks, and escalation policies.
+          Every answer is grounded in internal sources and fully auditable.
         </div>
         <div class="badges">
           <div class="badge"><span class="dot ok"></span><b>Source-backed</b> <span class="muted">verify before acting</span></div>
@@ -126,15 +125,16 @@
             <input id="k" class="num" type="number" min="0" max="8" value="3" />
             <label class="muted">mode</label>
             <select id="mode" class="select">
-              <option value="hybrid" selected>Hybrid (recommended)</option>
-              <option value="kb">Verified (KB only)</option>
-              <option value="chat">Assist: In private deployment, LLM-backed rewriting is enabled; hosted demo focuses on governance-first behavior.</option>
+              <option value="hybrid" selected>Hybrid — best for most questions</option>
+              <option value="kb">Verified — grounded in internal sources only</option>
+              <option value="chat">Assist — free-form help (LLM required)</option>
             </select>
 
             <button id="askBtn" class="btn" onclick="runAsk()">Run scenario</button>
             <button class="btn ghost" onclick="clearUI()">Clear</button>
           </div>
 
+          <div class="muted small" style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border)">Try a scenario:</div>
           <div class="try">
             <button class="btn secondary" onclick="quickAskScenario('escalation_policy')">Escalation policy</button>
             <button class="btn secondary" onclick="quickAskScenario('customer_outage_first')">Customer outage</button>
@@ -145,12 +145,28 @@
             <button class="btn secondary" onclick="quickAskScenario('modes_guidance')">Usage guidance</button>
           </div>
 
+          <!-- Free-form ask section -->
+          <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border)">
+            <div class="muted small" style="margin-bottom:8px">Or ask a free-form question:</div>
+            <textarea id="freeQ" class="input" placeholder="Type any question…" style="min-height:72px"></textarea>
+            <div class="row" style="margin-top:8px">
+              <select id="freeMode" class="select">
+                <option value="hybrid" selected>Hybrid — best for most questions</option>
+                <option value="kb">Verified — grounded in internal sources only</option>
+                <option value="chat">Assist — free-form help (LLM required)</option>
+              </select>
+              <button id="freeAskBtn" class="btn" onclick="runFreeAsk()">Ask</button>
+              <button class="btn ghost" onclick="clearUI()">Clear</button>
+            </div>
+          </div>
+
           <div id="friendlyHint" class="callout" style="display:none"></div>
 
           <!-- Answer -->
           <div id="answerCard" class="card" style="display:none">
             <h4>🧠 Answer</h4>
             <div id="answerBody" class="small"></div>
+            <div id="debugPanel" style="display:none;margin-top:12px;padding:8px 10px;background:#f4f4f4;border-radius:6px;font-size:11px;color:#666;line-height:1.7"></div>
           </div>
 
           <!-- Sources -->
@@ -252,6 +268,8 @@
     document.getElementById("techBox").style.display = "none";
     document.getElementById("errorBox").style.display = "none";
     document.getElementById("answerBody").innerHTML = "";
+    document.getElementById("debugPanel").style.display = "none";
+    document.getElementById("debugPanel").innerHTML = "";
     document.getElementById("sourcesBody").innerHTML = "";
     document.getElementById("techMeta").innerHTML = "";
     document.getElementById("rawJson").textContent = "";
@@ -335,6 +353,16 @@
 
     document.getElementById("answerBody").innerHTML = html;
     document.getElementById("answerCard").style.display = "block";
+
+    const dbg = data.debug || {};
+    if (dbg.routing !== undefined) {
+      const panel = document.getElementById("debugPanel");
+      panel.innerHTML =
+        `<b>Routing:</b> ${esc(dbg.routing)}&nbsp;&nbsp;` +
+        `<b>Tool used:</b> ${esc(dbg.tool_used || "null")}&nbsp;&nbsp;` +
+        `<b>LLM used:</b> ${dbg.llm_used ? "true" : "false"}`;
+      panel.style.display = "block";
+    }
   }
 
   function renderSources(data){
@@ -397,6 +425,61 @@
     return `Scenario: ${scenarioId}`; // fallback 永远非空
   }
 
+  async function runFreeAsk(){
+    const q = (document.getElementById("freeQ").value || "").trim();
+    if (!q){
+      document.getElementById("errorBox").style.display = "block";
+      document.getElementById("errorText").textContent = "Please enter a question.";
+      return;
+    }
+    const mode = document.getElementById("freeMode").value;
+    const k = Number(document.getElementById("k").value || 3);
+
+    clearUI();
+    const btn = document.getElementById("freeAskBtn");
+    btn.disabled = true;
+    setStatus("Asking…");
+    document.getElementById("answerBody").innerHTML = "Thinking…";
+    document.getElementById("answerCard").style.display = "block";
+
+    try {
+      const headers = {"Content-Type": "application/json"};
+      try {
+        const host = (location && location.hostname) ? location.hostname : "";
+        if (host === "127.0.0.1" || host === "localhost"){
+          headers["x-api-key"] = "dev-user-key";
+        }
+      } catch(e){}
+
+      const res = await fetch(new URL("/ask", location.origin).toString(), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({question: q, k, mode})  // no scenario_id
+      });
+
+      const text = await res.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch(_){}
+
+      if (!res.ok){
+        const msg = (data && (data.detail || data.message)) ? (data.detail || data.message) : text;
+        throw new Error(msg || `Request failed (${res.status})`);
+      }
+      if (!data) throw new Error("Server returned non-JSON response.");
+
+      renderAnswer(data);
+      renderSources(data);
+      renderTech(data);
+      setStatus(`Done · engine=${(data.meta && data.meta.engine) || "ok"}`);
+    } catch(err){
+      document.getElementById("errorBox").style.display = "block";
+      document.getElementById("errorText").textContent = String(err && err.message ? err.message : err);
+      setStatus("Error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   async function runAsk(){
     // scenario id 优先级：你点的快捷按钮 > 下拉框
     const scenarioId = (SELECTED_SCENARIO || document.getElementById("preset").value || "").trim();
@@ -425,6 +508,8 @@
     const askBtn = document.getElementById("askBtn");
     askBtn.disabled = true;
     setStatus("Running scenario…");
+    document.getElementById("answerBody").innerHTML = "Thinking…";
+    document.getElementById("answerCard").style.display = "block";
 
     try{
       const headers = {"Content-Type":"application/json"};

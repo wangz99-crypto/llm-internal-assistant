@@ -17,6 +17,13 @@ def test_health_ok():
     assert r.json().get("status") == "ok"
 
 
+def test_health_service_field():
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json().get("status") == "ok"
+    assert r.json().get("service") == "llm-gateway-demo"
+
+
 def test_kb_status_requires_admin():
     r = client.get("/kb_status", headers={"x-api-key": "dev-user-key"})
     assert r.status_code == 403

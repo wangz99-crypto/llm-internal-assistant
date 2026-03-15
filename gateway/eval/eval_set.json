@@ -1,0 +1,122 @@
+[
+  {
+    "id": "inc-01",
+    "category": "incident",
+    "difficulty": "easy",
+    "question": "What are the first steps when a customer-facing outage is detected?",
+    "expected_source_file": "incident_response.md",
+    "note": "File contains an explicit 'First actions during a customer-facing outage' section with a numbered list."
+  },
+  {
+    "id": "inc-02",
+    "category": "incident",
+    "difficulty": "easy",
+    "question": "How do I decide if something is a SEV-1 versus a SEV-2?",
+    "expected_source_file": "incident_response.md",
+    "note": "File defines all three severity levels with plain-language criteria. SEV-1 and SEV-2 appear verbatim."
+  },
+  {
+    "id": "inc-03",
+    "category": "incident",
+    "difficulty": "medium",
+    "question": "Our service is completely down and all requests are failing — what do I do right now?",
+    "expected_source_file": "incident_playbook_sev1.md",
+    "note": "Natural-language paraphrase of a SEV-1 condition. Tests whether retrieval distinguishes the SEV-1 playbook from the general incident_response doc."
+  },
+  {
+    "id": "inc-04",
+    "category": "incident_comms",
+    "difficulty": "medium",
+    "question": "What should a customer-facing status update include during an active incident?",
+    "expected_source_file": "incident_comms_templates.md",
+    "note": "Targets the comms-specific file. Tests that 'customer update' retrieves the comms template rather than the general response runbook."
+  },
+  {
+    "id": "esc-01",
+    "category": "escalation",
+    "difficulty": "easy",
+    "question": "How often should we post updates during a SEV-1?",
+    "expected_source_file": "escalation_policy.md",
+    "note": "File specifies 'every 30 minutes (SEV-1)'. Direct rule lookup with SEV-1 keyword present."
+  },
+  {
+    "id": "esc-02",
+    "category": "escalation",
+    "difficulty": "hard",
+    "question": "Who needs to be notified when a major incident is declared?",
+    "expected_source_file": "escalation_policy.md",
+    "note": "Paraphrase of 'Notify stakeholders per severity'. No keyword match on 'escalation' — relies entirely on semantic similarity."
+  },
+  {
+    "id": "esc-03",
+    "category": "escalation",
+    "difficulty": "medium",
+    "question": "How quickly do we need to start mitigation for a SEV-1?",
+    "expected_source_file": "escalation_policy.md",
+    "note": "File contains '15 minutes for SEV-1'. SEV-1 keyword helps but 'mitigation' and '15 minutes' are not in the query."
+  },
+  {
+    "id": "rbk-01",
+    "category": "runbook",
+    "difficulty": "easy",
+    "question": "How do I verify the gateway is running correctly after startup?",
+    "expected_source_file": "runbook.md",
+    "note": "File has an explicit startup checklist including the health check URL. 'gateway' and 'startup' both appear in the source."
+  },
+  {
+    "id": "rbk-02",
+    "category": "runbook",
+    "difficulty": "easy",
+    "question": "The gateway cannot reach the vLLM backend — what should I check?",
+    "expected_source_file": "runbook.md",
+    "note": "Maps directly to the 'Troubleshooting: gateway cannot reach vLLM' section. Near-verbatim phrasing."
+  },
+  {
+    "id": "rbk-03",
+    "category": "incident",
+    "difficulty": "medium",
+    "question": "What roles need to be assigned at the very start of a SEV-1 incident?",
+    "expected_source_file": "incident_playbook_sev1.md",
+    "note": "File specifies IC + Comms + Scribe. SEV-1 keyword present but 'roles' and 'assigned' are paraphrased away from the source wording."
+  },
+  {
+    "id": "aud-01",
+    "category": "audit",
+    "difficulty": "easy",
+    "question": "What information is stored in the audit log for each request?",
+    "expected_source_file": "audit_and_access.md",
+    "note": "File lists exact logged fields. 'audit' and 'log' appear verbatim, but security_controls also mentions audit — mild disambiguation needed."
+  },
+  {
+    "id": "aud-02",
+    "category": "audit",
+    "difficulty": "hard",
+    "question": "Is the user's actual question saved anywhere in the system?",
+    "expected_source_file": "audit_and_access.md",
+    "note": "Paraphrase of the 'do not log raw prompts' rule. No keyword overlap with the source — purely semantic match required."
+  },
+  {
+    "id": "sec-01",
+    "category": "security",
+    "difficulty": "medium",
+    "question": "How is access to admin-only endpoints restricted?",
+    "expected_source_file": "security_controls.md",
+    "note": "File covers RBAC and admin endpoint enforcement. Disambiguation challenge: audit_and_access also mentions admin access restrictions."
+  },
+  {
+    "id": "mode-01",
+    "category": "mode_selection",
+    "difficulty": "easy",
+    "question": "When should I use Verified mode instead of Hybrid?",
+    "expected_source_file": "knowledge_usage_guidelines.md",
+    "note": "File directly answers this. 'Verified' and 'Hybrid' appear verbatim in the source."
+  },
+  {
+    "id": "mode-02",
+    "category": "mode_selection",
+    "difficulty": "hard",
+    "question": "I'm answering a compliance question — which assistant mode is safest?",
+    "expected_source_file": "knowledge_usage_guidelines.md",
+    "note": "No mention of 'Verified' by name. 'Compliance → Verified mode' association must be inferred semantically."
+  }
+]
