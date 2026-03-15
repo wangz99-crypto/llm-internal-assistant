@@ -3,9 +3,11 @@
 
 An internal-facing LLM Gateway that wraps a raw LLM backend (vLLM) with:
 
+- hybrid keyword-semantic tool routing
 - authentication and role-based access control
 - deterministic business tools
 - retrieval-augmented grounding
+- retrieval quality evaluation harness
 - structured citation outputs
 - audit logging and metrics
 - CI-safe testability
@@ -33,7 +35,7 @@ curl https://llm-internal-assistant.onrender.com/health
 Expected:
 
 ```json
-{"status":"ok"}
+{"status":"ok","service":"llm-gateway-demo"}
 ```
 
 2) Try a deterministic tool query:
@@ -90,6 +92,10 @@ This repository implements the **gateway layer** — the part real companies act
 
 Operational queries are routed to deterministic tools before calling the LLM.
 
+Tool routing works in two layers:
+- **Keyword routing** — exact phrase matching; fast, deterministic, no embedding cost
+- **Semantic fallback** — when keyword routing finds no match, an embedding-based classifier compares the query against precomputed intent vectors. Definitional questions (`"what is ..."`, `"explain ..."`) are excluded before embedding to prevent false positives from shared domain vocabulary.
+
 Example:
 
 - "List open Sev-2 incidents" → `incident.list_open`
@@ -135,7 +141,10 @@ For knowledge questions, the gateway:
 - chunks with overlap
 - builds embeddings (SentenceTransformer)
 - performs cosine top-k retrieval
+- filters out low-relevance chunks below a cosine threshold before building LLM context
 - injects context into the LLM prompt
+
+If no chunks clear the relevance threshold, the response includes a structured warning (`warnings` field) rather than silently sending ungrounded context to the LLM.
 
 Answers are grounded in internal documentation, reducing hallucination risk.
 
@@ -147,7 +156,26 @@ DISABLE_EMBEDDINGS=1
 
 ---
 
-## 3) Enterprise Citation Cards
+## 3) Retrieval Evaluation Harness
+
+Retrieval quality is measured offline against a labeled eval set:
+
+- 15 ground-truth examples across incident, escalation, runbook, audit, and policy categories
+- tagged by difficulty (`easy` / `medium` / `hard`)
+- reports hit@1, hit@3, per-category and per-difficulty breakdown
+- identifies failed retrievals with predicted top-1 and top-3 source files
+
+Run without a live app or GPU:
+
+```bash
+PYTHONPATH=gateway python gateway/eval/retrieval_eval.py
+```
+
+Baseline (keyword-only routing): hit@3 = 13/15 (86%). The two persistent hard failures motivate the semantic routing layer.
+
+---
+
+## 5) Enterprise Citation Cards
 
 Responses return structured citation metadata:
 
@@ -170,7 +198,7 @@ Tool-mode citations are intelligently distributed across multiple documents to m
 
 ---
 
-## 4) Secure Access (Auth + RBAC)
+## 6) Secure Access (Auth + RBAC)
 
 All endpoints require API keys.
 
@@ -183,7 +211,7 @@ Unauthorized access returns structured 403 responses.
 
 ---
 
-## 5) Audit Logging (Privacy-Preserving)
+## 7) Audit Logging (Privacy-Preserving)
 
 Each request logs:
 
@@ -206,7 +234,7 @@ This mirrors internal AI governance requirements.
 
 ---
 
-## 6) Observability
+## 8) Observability
 
 Prometheus metrics included:
 
@@ -248,7 +276,8 @@ All responses follow a structured contract:
   "timings_ms": {
     "llm": 0,
     "total": 5
-  }
+  },
+  "warnings": []
 }
 ```
 
